@@ -1,0 +1,11 @@
+[package]
+name = "spectral-gpu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+spectral-core = { path = "../spectral-core" }
+wgpu = "22"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.3"
+glam = "0.29"

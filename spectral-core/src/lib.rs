@@ -1,6 +1,7 @@
 //! spectral-core: CPU spectral path tracer.
 
 pub mod rng;
+pub mod sellmeier;
 pub mod spectrum;
 
 #[cfg(test)]

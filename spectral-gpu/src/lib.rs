@@ -37,6 +37,26 @@ impl GpuContext {
             Some(GpuContext { device, queue })
         })
     }
+
+    /// Create a GpuContext using an existing instance and a surface for
+    /// adapter compatibility (so the adapter supports presentation on that surface).
+    /// Panics if no adapter or device is available.
+    pub fn new_for_surface(instance: &wgpu::Instance, surface: &wgpu::Surface<'_>) -> Self {
+        pollster::block_on(async {
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    compatible_surface: Some(surface),
+                    ..Default::default()
+                })
+                .await
+                .expect("no wgpu adapter compatible with surface");
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default(), None)
+                .await
+                .expect("request_device failed");
+            GpuContext { device, queue }
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -56,7 +76,7 @@ struct Params {
     n_primitives: u32,
     illuminant: u32,
     background: f32,
-    _pad: u32,
+    spectral: u32, // 1=spectral dispersion, 0=fixed n(550nm)
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +226,7 @@ impl<'ctx> GpuTracer<'ctx> {
         let accum_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("accum"),
             contents: &vec![0u8; accum_size as usize],
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         });
 
         // Readback staging buffer.
@@ -235,7 +255,7 @@ impl<'ctx> GpuTracer<'ctx> {
             n_primitives: n_real,
             illuminant: ill_u32,
             background: scene.background,
-            _pad: 0,
+            spectral: 1, // default: full spectral dispersion
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("params"),
@@ -332,6 +352,37 @@ impl<'ctx> GpuTracer<'ctx> {
         self.read_buf.unmap();
 
         result
+    }
+
+    /// Return a reference to the accumulation buffer (for blit pipelines).
+    pub fn accum_buffer(&self) -> &wgpu::Buffer {
+        &self.accum_buf
+    }
+
+    /// Return the render dimensions.
+    pub fn dims(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    /// Toggle spectral dispersion on (1) or off (0).
+    pub fn set_spectral(&mut self, on: bool) {
+        self.params.spectral = if on { 1 } else { 0 };
+    }
+
+    /// Update the camera, rebuilding the params basis vectors.
+    pub fn set_camera(&mut self, camera: &Camera) {
+        let (o, ll, h, v) = camera.view_basis();
+        self.params.cam_origin = [o.x, o.y, o.z, 0.0];
+        self.params.cam_lower_left = [ll.x, ll.y, ll.z, 0.0];
+        self.params.cam_horizontal = [h.x, h.y, h.z, 0.0];
+        self.params.cam_vertical = [v.x, v.y, v.z, 0.0];
+    }
+
+    /// Zero the accumulation buffer and reset sample counts.
+    pub fn clear_accum(&self) {
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        enc.clear_buffer(&self.accum_buf, 0, None);
+        self.queue.submit([enc.finish()]);
     }
 }
 

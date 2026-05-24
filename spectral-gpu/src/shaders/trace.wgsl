@@ -55,7 +55,7 @@ struct Params {
     n_primitives:   u32,
     illuminant:     u32,   // 0=D65, 1=A
     background:     f32,
-    _pad:           u32,
+    spectral:       u32,   // 1=spectral dispersion, 0=fixed n(550nm) / RGB-like
 }
 
 // ---------------------------------------------------------------------------
@@ -474,9 +474,10 @@ fn sample_pixel(px: u32, py: u32, sample_idx: u32) -> vec3<f32> {
         let mat = materials[sh.mat_idx];
 
         // n_hero: ior at hero wavelength (lane 0) for dielectrics, else 1.0
+        // spectral=1 -> per-wavelength dispersion; spectral=0 -> fixed n(550nm), no rainbow
         var n_hero: f32;
         if mat.kind == 1u {
-            n_hero = sellmeier_n(mat.glass, lambda[0]);
+            n_hero = select(sellmeier_n(mat.glass, 550.0), sellmeier_n(mat.glass, lambda[0]), params.spectral == 1u);
         } else {
             n_hero = 1.0;
         }

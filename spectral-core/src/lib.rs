@@ -1,5 +1,7 @@
 //! spectral-core: CPU spectral path tracer.
 
+pub mod spectrum;
+
 #[cfg(test)]
 mod smoke {
     #[test]

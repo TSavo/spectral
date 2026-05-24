@@ -1,5 +1,8 @@
 //! GPU mirror of the CPU spectral path tracer.
 
+pub mod data;
+pub mod upload;
+
 /// A headless wgpu device + queue.
 pub struct GpuContext {
     pub device: wgpu::Device,

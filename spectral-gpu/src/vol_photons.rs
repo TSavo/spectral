@@ -73,6 +73,11 @@ pub struct VolParamsGpu {
     pub sigma_t: f32,     // haze extinction coefficient (transmittance exp(-sigma_t d))
     pub g: f32,           // Henyey-Greenstein anisotropy (g>0 forward)
     pub photon_base: u32, // chunking: photon i = photon_base + gid.x
+    // VOL-6 dispersion toggle (1 = n(lambda) dispersion on; 0 = n(550) collapsed white)
+    pub spectral: u32,
+    pub _pad2: u32,
+    pub _pad3: u32,
+    pub _pad4: u32,
 }
 
 /// Per-photon debug record — must match DebugPhoton in volume.wgsl byte-for-byte.
@@ -175,6 +180,45 @@ fn flatten_scene(scene: &Scene) -> (Vec<GpuPrimitive>, Vec<GpuPlane>, Vec<GpuMat
     }
 
     (prims, planes, mats)
+}
+
+/// The exact "Dark Side of the Moon" scene from prism_dsotm.rs: an equilateral
+/// SF11 prism, the thin white minimum-deviation beam, and the face-on camera at
+/// the given aspect ratio. Shared by the examples, the viewer, and the gates.
+pub fn dsotm_scene(aspect: f32) -> (Scene, Beam, Camera) {
+    use spectral_core::geom::{ConvexSolid, Plane};
+    use glam::Vec3;
+
+    let k = 0.9_f32;
+    let planes = vec![
+        Plane { normal: Vec3::new(-0.866_025_4, 0.5, 0.0), d: -k }, // left face
+        Plane { normal: Vec3::new( 0.866_025_4, 0.5, 0.0), d: -k }, // right face
+        Plane { normal: Vec3::new(0.0, -1.0, 0.0), d: -1.0 },       // base
+        Plane { normal: Vec3::Z,  d: -1.0 },                         // +Z cap
+        Plane { normal: -Vec3::Z, d: -1.0 },                         // -Z cap
+    ];
+    let mut scene = Scene::new();
+    scene.background = 0.0;
+    scene.add_solid(ConvexSolid { planes }, Material::Dielectric { glass: Glass::Sf11 });
+
+    let bdir  = Vec3::new(0.84, 0.54, 0.0).normalize();
+    let bperp = Vec3::new(-0.54, 0.84, 0.0).normalize() * 0.05;
+    let beam = Beam {
+        corner: Vec3::new(-2.6, -0.95, -0.6),
+        u:      Vec3::new(0.0, 0.0, 1.2),
+        v:      bperp,
+        dir:    bdir,
+    };
+
+    let cam = Camera::look_at(
+        Vec3::new(0.5, -0.5, 12.0),
+        Vec3::new(0.5, -0.5,  0.0),
+        Vec3::Y,
+        42.0,
+        aspect,
+    );
+
+    (scene, beam, cam)
 }
 
 /// GPU forward photon film.
@@ -298,6 +342,10 @@ impl<'ctx> GpuPhotonFilm<'ctx> {
             sigma_t: weights.sigma_t,
             g:       weights.g,
             photon_base: 0,
+            spectral: 1, // dispersion ON by default (matches pre-VOL-6 behavior)
+            _pad2: 0,
+            _pad3: 0,
+            _pad4: 0,
         };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -570,6 +618,53 @@ impl<'ctx> GpuPhotonFilm<'ctx> {
         self.queue.submit([enc.finish()]);
     }
 
+    // -----------------------------------------------------------------------
+    // VOL-6 viewer API: drive the photon kernel into the GPU film WITHOUT the
+    // CPU readback/resolve. The viewer owns a GPU-resident accum + a resolve
+    // compute pass that reads & clears the film each frame. Purely additive;
+    // the CPU-readback paths above (trace_and_resolve / trace_chunked /
+    // recompute_surface) are unchanged, so VOL-2/3/4/5 gates are unaffected.
+    // -----------------------------------------------------------------------
+
+    /// Dispatch a single photon batch into the GPU film (no CPU resolve). The
+    /// caller (viewer) runs its own GPU resolve pass to drain the film into a
+    /// GPU-resident accumulator. `n_photons` is the total/extent; only photons in
+    /// [photon_base, photon_base + MAX_PER_DISPATCH) actually run this call.
+    pub fn dispatch_photons(&mut self, photon_base: u32, n_photons: u32, seed: u32) {
+        self.dispatch_chunk(photon_base, n_photons, seed);
+    }
+
+    /// The atomic film buffer (3*w*h u32, interleaved XYZ, fixed-point ×SCALE).
+    /// The viewer binds this read_write in its resolve pass.
+    pub fn film_buf(&self) -> &wgpu::Buffer {
+        &self.film_buf
+    }
+
+    /// The VolParams uniform buffer (the viewer rebinds it in its compute pipeline
+    /// so the photon kernel and the viewer's resolve/blit share one params source).
+    pub fn params_buf(&self) -> &wgpu::Buffer {
+        &self.params_buf
+    }
+
+    /// The compute bind group for the photon kernel (group 0). Exposed so the
+    /// viewer can reuse the kernel dispatch verbatim.
+    pub fn bind_group(&self) -> &wgpu::BindGroup {
+        &self.bind_group
+    }
+
+    /// Toggle dispersion: `true` = n(lambda) per-wavelength (rainbow fan);
+    /// `false` = fixed n(550) for all wavelengths (collapsed white beam). Uploads
+    /// the changed param immediately.
+    pub fn set_spectral(&mut self, on: bool) {
+        self.params.spectral = if on { 1 } else { 0 };
+        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+    }
+
+    /// Whether dispersion is currently on.
+    pub fn spectral(&self) -> bool {
+        self.params.spectral == 1
+    }
+
     /// Resolve: read back the u32 film, divide by SCALE, add into accum, clear film.
     fn resolve(&mut self) {
         let raw = self.read_film_raw();
@@ -762,12 +857,11 @@ impl<'ctx> GpuPhotonFilm<'ctx> {
 pub mod tests {
     use super::*;
     use spectral_core::camera::Camera;
-    use spectral_core::geom::{ConvexSolid, Plane, Ray};
+    use spectral_core::geom::Ray;
     use spectral_core::lighttrace::Beam;
     use spectral_core::material::Material;
     use spectral_core::rng::PathRng;
     use spectral_core::scene::Scene;
-    use spectral_core::sellmeier::Glass;
     use spectral_core::spectrum::{LAMBDA_MIN, LAMBDA_RANGE};
     use glam::Vec3;
 
@@ -809,38 +903,10 @@ pub mod tests {
         eprintln!("phase_hg_matches_cpu_oracle: max delta over {} cases = {max_delta:.3e}", cases.len());
     }
 
-    /// Build the exact prism_dsotm.rs scene + beam + camera.
+    /// The exact prism_dsotm.rs scene + beam + camera (aspect 1.0). Delegates to
+    /// the module-level `dsotm_scene` so the gates and the viewer share one source.
     pub fn dsotm_scene() -> (Scene, Beam, Camera) {
-        let k = 0.9_f32;
-        let planes = vec![
-            Plane { normal: Vec3::new(-0.866_025_4, 0.5, 0.0), d: -k },
-            Plane { normal: Vec3::new( 0.866_025_4, 0.5, 0.0), d: -k },
-            Plane { normal: Vec3::new(0.0, -1.0, 0.0), d: -1.0 },
-            Plane { normal: Vec3::Z,  d: -1.0 },
-            Plane { normal: -Vec3::Z, d: -1.0 },
-        ];
-        let mut scene = Scene::new();
-        scene.background = 0.0;
-        scene.add_solid(ConvexSolid { planes }, Material::Dielectric { glass: Glass::Sf11 });
-
-        let bdir  = Vec3::new(0.84, 0.54, 0.0).normalize();
-        let bperp = Vec3::new(-0.54, 0.84, 0.0).normalize() * 0.05;
-        let beam = Beam {
-            corner: Vec3::new(-2.6, -0.95, -0.6),
-            u:      Vec3::new(0.0, 0.0, 1.2),
-            v:      bperp,
-            dir:    bdir,
-        };
-
-        let cam = Camera::look_at(
-            Vec3::new(0.5, -0.5, 12.0),
-            Vec3::new(0.5, -0.5,  0.0),
-            Vec3::Y,
-            42.0,
-            1.0,
-        );
-
-        (scene, beam, cam)
+        super::dsotm_scene(1.0)
     }
 
     /// CPU simulation of one photon through the DSOTM beam — convenience wrapper.

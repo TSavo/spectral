@@ -94,6 +94,11 @@ struct VolParams {
     sigma_t:      f32,
     g:            f32,
     photon_base:  u32,        // chunking: photon i = photon_base + gid.x
+    // VOL-6 dispersion toggle (1 = n(lambda) dispersion; 0 = n(550) collapsed white)
+    spectral:     u32,
+    _pad2:        u32,
+    _pad3:        u32,
+    _pad4:        u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -549,11 +554,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             break; // escaped
         }
 
-        // Mirror: n_hero = glass.n(lambda) for dielectric, else 1.0
+        // Mirror: n_hero = glass.n(lambda) for dielectric, else 1.0.
+        // VOL-6: spectral==1 -> per-wavelength n(lambda) (dispersion / rainbow);
+        //        spectral==0 -> fixed n(550) for ALL wavelengths -> no angular
+        //        spread -> the fan collapses to one white refracted beam.
         let mat   = materials[sh.mat_idx];
         var n_hero: f32;
         if mat.kind == 1u {
-            n_hero = sellmeier_n(mat.glass, lambda);
+            n_hero = select(sellmeier_n(mat.glass, 550.0),
+                            sellmeier_n(mat.glass, lambda),
+                            params.spectral == 1u);
         } else {
             n_hero = 1.0;
         }

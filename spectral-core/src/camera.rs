@@ -31,6 +31,12 @@ impl Camera {
         self.origin
     }
 
+    /// The pinhole basis vectors (origin, lower_left, horizontal, vertical), used
+    /// to reconstruct primary rays on the GPU exactly as `primary_ray` does on CPU.
+    pub fn view_basis(&self) -> (Vec3, Vec3, Vec3, Vec3) {
+        (self.origin, self.lower_left, self.horizontal, self.vertical)
+    }
+
     /// `s`,`t` in [0,1] across the image (origin bottom-left).
     pub fn primary_ray(&self, s: f32, t: f32) -> Ray {
         let dir = (self.lower_left + s * self.horizontal + t * self.vertical - self.origin)

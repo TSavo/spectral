@@ -61,13 +61,14 @@ impl CpuTracer {
         for _ in 0..self.max_bounces {
             match self.scene.intersect(&ray) {
                 None => {
+                    let bg = self.scene.background_radiance(ray.dir);
                     for (rad, (&lam, &tk)) in spec
                         .radiance
                         .iter_mut()
                         .zip(spec.lambda.iter().zip(throughput.iter()))
                     {
                         let sp = self.sensor.illuminant(self.illuminant, lam);
-                        *rad += tk * self.scene.background * sp;
+                        *rad += tk * bg * sp;
                     }
                     break;
                 }

@@ -19,6 +19,10 @@ pub struct Primitive {
 pub struct Scene {
     pub primitives: Vec<Primitive>,
     pub background: f32,
+    /// Optional extra radiance for rays pointing above the horizon (y > 0).
+    /// When `Some(above)`, rays with `dir.y > 0` receive `background + above`.
+    /// `None` gives a fully uniform background.
+    pub horizon: Option<f32>,
 }
 
 impl Default for Scene {
@@ -29,7 +33,20 @@ impl Default for Scene {
 
 impl Scene {
     pub fn new() -> Self {
-        Scene { primitives: Vec::new(), background: 1.0 }
+        Scene { primitives: Vec::new(), background: 1.0, horizon: None }
+    }
+
+    /// Background radiance for a ray that escaped the scene, as a function of
+    /// its direction. Uniform `background` everywhere, plus, if `horizon` is set,
+    /// an extra bright contribution for rays pointing above the horizon (y > 0).
+    /// The spectral shape comes from the illuminant in the tracer; this is a
+    /// scalar radiance scale only.
+    pub fn background_radiance(&self, dir: Vec3) -> f32 {
+        let sky = match self.horizon {
+            Some(above) if dir.y > 0.0 => above,
+            _ => 0.0,
+        };
+        self.background + sky
     }
 
     pub fn add_sphere(&mut self, center: Vec3, radius: f32, material: Material) {
@@ -89,5 +106,16 @@ mod tests {
         let scene = Scene::new();
         let r = Ray { origin: Vec3::ZERO, dir: -Vec3::Z };
         assert!(scene.intersect(&r).is_none());
+    }
+
+    #[test]
+    fn background_radiance_uniform_then_horizon() {
+        let mut scene = Scene::new();
+        scene.background = 0.5;
+        assert_eq!(scene.background_radiance(Vec3::Y), 0.5); // no horizon -> uniform
+        assert_eq!(scene.background_radiance(-Vec3::Y), 0.5);
+        scene.horizon = Some(2.0);
+        assert_eq!(scene.background_radiance(Vec3::Y), 2.5);  // above horizon
+        assert_eq!(scene.background_radiance(-Vec3::Y), 0.5); // below unchanged
     }
 }

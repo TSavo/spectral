@@ -44,6 +44,7 @@ pub mod scene;
 pub mod sellmeier;
 pub mod spectrum;
 pub mod tracer;
+pub mod volume;
 
 #[cfg(test)]
 mod smoke {

@@ -26,11 +26,40 @@ impl Camera {
         Camera { origin, lower_left, horizontal, vertical }
     }
 
+    /// The camera's eye position (same for every pixel of a pinhole camera).
+    pub fn origin(&self) -> Vec3 {
+        self.origin
+    }
+
     /// `s`,`t` in [0,1] across the image (origin bottom-left).
     pub fn primary_ray(&self, s: f32, t: f32) -> Ray {
         let dir = (self.lower_left + s * self.horizontal + t * self.vertical - self.origin)
             .normalize();
         Ray { origin: self.origin, dir }
+    }
+
+    /// Project a world point to screen coordinates (s, t) in [0,1] plus depth in
+    /// front of the camera. Returns None if the point is behind the camera or
+    /// outside the frame. Inverse of `primary_ray`.
+    pub fn project(&self, p: Vec3) -> Option<(f32, f32, f32)> {
+        let u = self.horizontal.normalize();
+        let v = self.vertical.normalize();
+        let vw = self.horizontal.length();
+        let vh = self.vertical.length();
+        // w points from target toward origin; the view direction is -w.
+        let w = self.origin - self.horizontal * 0.5 - self.vertical * 0.5 - self.lower_left;
+        let dir = p - self.origin;
+        let c = dir.dot(w); // in front of camera => c < 0
+        if c >= -1e-6 {
+            return None;
+        }
+        let s = 0.5 + dir.dot(u) / (-c * vw);
+        let t = 0.5 + dir.dot(v) / (-c * vh);
+        if (0.0..1.0).contains(&s) && (0.0..1.0).contains(&t) {
+            Some((s, t, -c))
+        } else {
+            None
+        }
     }
 }
 
@@ -59,5 +88,18 @@ mod tests {
         let center = cam.primary_ray(0.5, 0.5).dir;
         let corner = cam.primary_ray(0.0, 0.0).dir;
         assert!((center - corner).length() > 1e-2, "corner ray must differ from center");
+    }
+
+    #[test]
+    fn project_inverts_primary_ray() {
+        let cam = Camera::look_at(Vec3::new(0.0, 1.0, 5.0), Vec3::ZERO, Vec3::Y, 50.0, 1.5);
+        for (s, t) in [(0.5, 0.5), (0.2, 0.7), (0.8, 0.35)] {
+            let ray = cam.primary_ray(s, t);
+            let p = ray.origin + ray.dir * 4.0; // a point along that pixel's ray
+            let (ps, pt, depth) = cam.project(p).expect("point should be in frame");
+            assert!((ps - s).abs() < 1e-3, "s: {ps} vs {s}");
+            assert!((pt - t).abs() < 1e-3, "t: {pt} vs {t}");
+            assert!(depth > 0.0, "depth must be positive in front of camera");
+        }
     }
 }

@@ -59,20 +59,55 @@ impl Screen {
         }
     }
 
+    /// Texel coordinates for fractional screen coords: returns the lower-left
+    /// texel (x0,y0), its upper-right neighbor (x1,y1), and the bilinear weights
+    /// (dx,dy). r runs along v (upward); row 0 is the top.
+    fn texel_bilinear(&self, s: f32, r: f32) -> (usize, usize, usize, usize, f32, f32) {
+        let fx = (s * self.width as f32 - 0.5).clamp(0.0, self.width as f32 - 1.0);
+        let fy = ((1.0 - r) * self.height as f32 - 0.5).clamp(0.0, self.height as f32 - 1.0);
+        let x0 = fx.floor() as usize;
+        let y0 = fy.floor() as usize;
+        let x1 = (x0 + 1).min(self.width - 1);
+        let y1 = (y0 + 1).min(self.height - 1);
+        (x0, y0, x1, y1, fx - x0 as f32, fy - y0 as f32)
+    }
+
     fn splat(&mut self, s: f32, r: f32, lambda: f32, power: f32) {
-        let px = ((s * self.width as f32) as usize).min(self.width - 1);
-        // r runs along v (upward); map to image row with row 0 at the top.
-        let py = (((1.0 - r) * self.height as f32) as usize).min(self.height - 1);
         let (x, y, z) = self.sensor.cmf(lambda);
-        let i = py * self.width + px;
-        self.sum[i][0] += x * power;
-        self.sum[i][1] += y * power;
-        self.sum[i][2] += z * power;
+        let (x0, y0, x1, y1, dx, dy) = self.texel_bilinear(s, r);
+        let w = self.width;
+        // Bilinear deposit into the four surrounding texels for a smooth caustic.
+        for (xi, yi, wgt) in [
+            (x0, y0, (1.0 - dx) * (1.0 - dy)),
+            (x1, y0, dx * (1.0 - dy)),
+            (x0, y1, (1.0 - dx) * dy),
+            (x1, y1, dx * dy),
+        ] {
+            let i = yi * w + xi;
+            self.sum[i][0] += x * power * wgt;
+            self.sum[i][1] += y * power * wgt;
+            self.sum[i][2] += z * power * wgt;
+        }
     }
 
     /// The accumulated XYZ buffer scaled by `scale` (e.g. 1/num_photons * gain).
     pub fn scaled(&self, scale: f32) -> Vec<Xyz> {
         self.sum.iter().map(|p| [p[0] * scale, p[1] * scale, p[2] * scale]).collect()
+    }
+
+    /// Deposited XYZ at fractional screen coordinates s,r in [0,1), bilinearly
+    /// interpolated from the four surrounding texels.
+    pub fn sample(&self, s: f32, r: f32) -> Xyz {
+        let (x0, y0, x1, y1, dx, dy) = self.texel_bilinear(s, r);
+        let w = self.width;
+        let mut out = [0.0f32; 3];
+        for (c, o) in out.iter_mut().enumerate() {
+            *o = self.sum[y0 * w + x0][c] * (1.0 - dx) * (1.0 - dy)
+                + self.sum[y0 * w + x1][c] * dx * (1.0 - dy)
+                + self.sum[y1 * w + x0][c] * (1.0 - dx) * dy
+                + self.sum[y1 * w + x1][c] * dx * dy;
+        }
+        out
     }
 }
 
@@ -191,5 +226,22 @@ mod tests {
 
         assert!(sep0 < 1e-4, "without a prism there is no dispersion, got sep0={sep0}");
         assert!(sep > 0.02, "prism must separate blue and red on the screen, got sep={sep}");
+    }
+
+    #[test]
+    fn screen_sample_reads_deposited_energy() {
+        // After tracing the dispersing beam, some texel on the screen is lit.
+        let mut screen = make_screen();
+        let beam = make_beam();
+        let mut prism = Scene::new();
+        prism.add_solid(crate::geom::ConvexSolid::wedge(30.0, 1.0, 2.0),
+            crate::material::Material::Dielectric { glass: crate::sellmeier::Glass::Sf11 });
+        trace(&prism, &mut screen, &beam, 100_000, 1);
+        let mut max = 0.0f32;
+        for r_i in 0..64 { for s_i in 0..64 {
+            let c = screen.sample((s_i as f32 + 0.5)/64.0, (r_i as f32 + 0.5)/64.0);
+            max = max.max(c[1]);
+        }}
+        assert!(max > 0.0, "the wall must have received some photon energy");
     }
 }

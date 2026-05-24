@@ -49,6 +49,9 @@ impl Material {
                 } else {
                     (n_hero, 1.0)
                 };
+                // Fresnel uses the hero index for all lanes; R varies only weakly
+                // with λ for dielectrics, and this is consistent with the
+                // collapse-to-hero on dispersion in the tracer.
                 let r = fresnel_reflectance(cos_i, n1, n2);
                 if rng.next_f32() < r {
                     Some(Scatter { dir: reflect(wo_in, hit.normal), weight: 1.0 })

@@ -4,8 +4,13 @@
 //! dependence is the metamerism signature and proves the sensor is doing real
 //! spectral color science, not RGB tinting.
 
+use spectral_core::camera::Camera;
 use spectral_core::cie::{chromaticity, Illuminant, Sensor};
+use spectral_core::scene::Scene;
 use spectral_core::spectrum::{LAMBDA_MAX, LAMBDA_MIN};
+use spectral_core::tracer::CpuTracer;
+use spectral_core::Renderer;
+use glam::Vec3;
 
 /// Integrate a reflectance R(λ) under an illuminant, returning chromaticity (x,y).
 fn chroma_under(sensor: &Sensor, refl: &dyn Fn(f32) -> f32, ill: Illuminant) -> (f32, f32) {
@@ -57,5 +62,39 @@ fn illuminant_swap_changes_color_relationship() {
     assert!(
         (d_a - d_d65).abs() > 1e-3,
         "color relationship must shift with illuminant: d65={d_d65}, a={d_a}"
+    );
+}
+
+#[test]
+fn renderer_output_depends_on_illuminant() {
+    // RENDER-LEVEL gate: the path tracer must actually use its illuminant. The
+    // same scene rendered under D65 vs A must differ in mean chromaticity. This
+    // catches a tracer that ignores self.illuminant (e.g. hardcodes one).
+    let render = |ill| {
+        let mut scene = Scene::new();
+        scene.background = 1.0;
+        let cam = Camera::look_at(Vec3::ZERO, Vec3::new(0.0, 0.0, -1.0), Vec3::Y, 60.0, 1.0);
+        let mut t = CpuTracer::new(scene, cam, 16, 16, ill, 5);
+        t.accumulate(128);
+        let m = t.buffer().mean();
+        let mut sum = [0.0f32; 3];
+        for p in &m {
+            sum[0] += p[0];
+            sum[1] += p[1];
+            sum[2] += p[2];
+        }
+        chromaticity(sum)
+    };
+    let (xd, yd) = render(Illuminant::D65);
+    let (xa, ya) = render(Illuminant::A);
+    let dist = ((xd - xa).powi(2) + (yd - ya).powi(2)).sqrt();
+    assert!(
+        dist > 0.05,
+        "rendered color must change with illuminant: D65=({xd},{yd}) A=({xa},{ya}) dist={dist}"
+    );
+    // Sanity: the D65 render sits at the D65 white point.
+    assert!(
+        (xd - 0.3127).abs() < 6e-3 && (yd - 0.3290).abs() < 6e-3,
+        "D65 render not at white point: ({xd},{yd})"
     );
 }

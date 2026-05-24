@@ -9,3 +9,6 @@ wgpu = "22"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.3"
 glam = "0.29"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

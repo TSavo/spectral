@@ -1,10 +1,12 @@
 //! spectral-core: CPU spectral path tracer.
 
+pub mod camera;
 pub mod cie;
 pub mod geom;
 pub mod material;
 pub mod optics;
 pub mod rng;
+pub mod scene;
 pub mod sellmeier;
 pub mod spectrum;
 

@@ -36,6 +36,7 @@ pub trait Renderer {
 pub mod camera;
 pub mod cie;
 pub mod geom;
+pub mod lighttrace;
 pub mod material;
 pub mod optics;
 pub mod rng;

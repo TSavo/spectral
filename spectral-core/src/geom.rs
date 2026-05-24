@@ -102,6 +102,24 @@ impl ConvexSolid {
         ConvexSolid { planes }
     }
 
+    /// A glass wedge for refraction demos. The entry face has outward normal -X
+    /// (a +X beam enters it at normal incidence); the exit face is tilted by
+    /// `apex_deg` from the entry face, so the internal beam strikes the exit face
+    /// at incidence `apex_deg`. Closed by a base (normal -Y) and Z end caps.
+    /// `size` sets the scale; `depth` the Z extent.
+    pub fn wedge(apex_deg: f32, size: f32, depth: f32) -> Self {
+        let a = apex_deg.to_radians();
+        ConvexSolid {
+            planes: vec![
+                Plane { normal: Vec3::new(-1.0, 0.0, 0.0), d: -size },
+                Plane { normal: Vec3::new(a.cos(), a.sin(), 0.0), d: -size },
+                Plane { normal: Vec3::new(0.0, -1.0, 0.0), d: -size },
+                Plane { normal: Vec3::Z, d: -depth / 2.0 },
+                Plane { normal: -Vec3::Z, d: -depth / 2.0 },
+            ],
+        }
+    }
+
     /// Intersect the ray with the convex solid (slab method). Returns the first
     /// surface crossing strictly ahead of `t_min`. If the ray origin is INSIDE
     /// the solid, this is the exit face (essential for rays refracting through
@@ -191,6 +209,11 @@ mod tests {
     fn prism_is_five_halfspaces() {
         let p = ConvexSolid::triangular_prism(2.0, 2.0);
         assert_eq!(p.planes.len(), 5);
+    }
+
+    #[test]
+    fn wedge_is_five_halfspaces() {
+        assert_eq!(ConvexSolid::wedge(30.0, 1.0, 2.0).planes.len(), 5);
     }
 
     #[test]

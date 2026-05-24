@@ -223,11 +223,11 @@ fn sphere_hit(prim: GpuPrimitive, ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_ma
         return h;
     }
     let sqrt_d = sqrt(disc);
-    // Find the nearest root in [t_min, t_max]
+    // Find the nearest root in (t_min, t_max) — strict, mirrors Sphere::intersect
     var t = (-half_b - sqrt_d) / a;
-    if t <= t_min || t >= t_max {
+    if t < t_min || t > t_max {
         t = (-half_b + sqrt_d) / a;
-        if t <= t_min || t >= t_max {
+        if t < t_min || t > t_max {
             return h;
         }
     }

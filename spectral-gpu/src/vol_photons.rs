@@ -1,15 +1,17 @@
-// VOL-2: GPU forward photon kernel.
+// VOL-2/3: GPU forward photon kernel.
 //
 // Builds and dispatches the volume.wgsl compute kernel, which mirrors
 // render_volumetric_scene() from spectral-core. One GPU thread per photon.
 //
 // Binding layout (must match volume.wgsl exactly):
-//   @binding(0) uniform VolParamsGpu  -- photon params + camera + beam
+//   @binding(0) uniform VolParamsGpu  -- photon params + camera + beam + sigma/g
 //   @binding(1) storage  primitives
 //   @binding(2) storage  planes
 //   @binding(3) storage  materials
 //   @binding(4) storage  tables (CMF + illuminants)
 //   @binding(5) storage  film (atomic<u32>, 3 * width * height)
+//   @binding(6) storage  debug_out (per-photon state, VOL-2 parity gate)
+//   @binding(7) storage  zbuffer (f32 per pixel; INF = no occlusion)
 
 use bytemuck::{Pod, Zeroable, cast_slice};
 use spectral_core::camera::Camera;
@@ -23,8 +25,21 @@ use crate::data::sample_tables;
 use crate::upload::{GpuMaterial, GpuPlane, GpuPrimitive};
 use crate::GpuContext;
 
-/// Fixed-point scale — must match SCALE in volume.wgsl.
-const SCALE: f32 = 4096.0;
+/// Fixed-point scale = 2^23 — MUST match SCALE in volume.wgsl. Load-bearing for
+/// the VOL-4 diff gate: VOL-3 weighted contributions are ~1e-5..1e-7 per splat,
+/// which underflowed to zero at the VOL-1 scale of 2^12. Diff-gate L1 scales
+/// ~1/SCALE (2^20 -> 1.97%, 2^23 -> 0.28%); 2^23 clears the <1% gate with margin.
+const SCALE: f32 = 8388608.0;
+
+/// Henyey-Greenstein phase function, computed with the EXACT operation order of
+/// the WGSL `phase_hg` in volume.wgsl (clamp BEFORE pow, 4π in the denom). Used by
+/// the phase_hg_matches_cpu_oracle unit test to prove the WGSL formula matches
+/// volume.rs::phase_hg. Kept in sync with the WGSL by hand.
+pub fn phase_hg_wgsl_mirror(g: f32, cos_theta: f32) -> f32 {
+    let g2 = g * g;
+    let denom = (1.0 + g2 - 2.0 * g * cos_theta).max(1e-6).powf(1.5);
+    (1.0 - g2) / (4.0 * std::f32::consts::PI * denom)
+}
 
 // ---------------------------------------------------------------------------
 // Uniform struct — must match VolParams in volume.wgsl byte-for-byte.
@@ -53,6 +68,11 @@ pub struct VolParamsGpu {
     pub cam_u: [f32; 4], // xyz=horizontal.normalize(), w=horizontal.length()
     pub cam_v: [f32; 4], // xyz=vertical.normalize(),   w=vertical.length()
     pub cam_w: [f32; 4], // xyz=origin - horiz/2 - vert/2 - lower_left (the "back" vector)
+    // VOL-3 single-scatter weight parameters
+    pub sigma_s: f32,     // haze scattering coefficient
+    pub sigma_t: f32,     // haze extinction coefficient (transmittance exp(-sigma_t d))
+    pub g: f32,           // Henyey-Greenstein anisotropy (g>0 forward)
+    pub photon_base: u32, // chunking: photon i = photon_base + gid.x
 }
 
 /// Per-photon debug record — must match DebugPhoton in volume.wgsl byte-for-byte.
@@ -159,7 +179,7 @@ fn flatten_scene(scene: &Scene) -> (Vec<GpuPrimitive>, Vec<GpuPlane>, Vec<GpuMat
 
 /// GPU forward photon film.
 ///
-/// Holds all GPU buffers for the VOL-2 forward photon kernel plus a CPU f32
+/// Holds all GPU buffers for the VOL-2/3 forward photon kernel plus a CPU f32
 /// accumulator for progressive multi-batch rendering.
 pub struct GpuPhotonFilm<'ctx> {
     device:        &'ctx wgpu::Device,
@@ -182,8 +202,26 @@ pub struct GpuPhotonFilm<'ctx> {
 /// so it must be sized for the largest debug run we might do.
 const DEBUG_CAPACITY: u32 = 2048;
 
+/// VOL-3 single-scatter weight parameters bundled to keep the ctor arg count sane.
+#[derive(Clone, Copy)]
+pub struct VolWeights {
+    pub sigma_s: f32,
+    pub sigma_t: f32,
+    pub g: f32,
+}
+
+impl Default for VolWeights {
+    /// DSOTM defaults: sigma_s=0.5, sigma_t=0.06, g=0.5.
+    fn default() -> Self {
+        VolWeights { sigma_s: 0.5, sigma_t: 0.06, g: 0.5 }
+    }
+}
+
 impl<'ctx> GpuPhotonFilm<'ctx> {
-    /// Build the kernel. `scene`, `camera`, `beam` define the scene.
+    /// Build the kernel.
+    ///
+    /// `zbuffer`: per-pixel nearest-solid euclidean depth (length width*height).
+    /// `None` = an all-INFINITY zbuffer (no occlusion, DSOTM).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ctx: &'ctx GpuContext,
@@ -195,9 +233,22 @@ impl<'ctx> GpuPhotonFilm<'ctx> {
         n_photons: u32,
         seed: u32,
         max_dist: f32,
+        weights: VolWeights,
+        zbuffer: Option<&[f32]>,
     ) -> Self {
         let device = &ctx.device;
         let queue  = &ctx.queue;
+
+        // Sanity: the precomputed cam_origin must equal camera.origin() (the oracle
+        // uses camera.origin() directly). Cheap insurance against a wiring drift.
+        {
+            let co = camera.origin();
+            let (po, _, _, _) = camera_proj_params(camera);
+            debug_assert!(
+                (po[0] - co.x).abs() < 1e-5 && (po[1] - co.y).abs() < 1e-5 && (po[2] - co.z).abs() < 1e-5,
+                "cam_origin {po:?} != camera.origin() {co:?}"
+            );
+        }
 
         let n = width * height;
         let film_len  = (3 * n) as u64;
@@ -238,6 +289,10 @@ impl<'ctx> GpuPhotonFilm<'ctx> {
             cam_u,
             cam_v,
             cam_w,
+            sigma_s: weights.sigma_s,
+            sigma_t: weights.sigma_t,
+            g:       weights.g,
+            photon_base: 0,
         };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -298,6 +353,20 @@ impl<'ctx> GpuPhotonFilm<'ctx> {
             size:               debug_size,
             usage:              wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
+        });
+
+        // Zbuffer (one f32 per pixel). None -> all-INFINITY (no occlusion).
+        let zbuf_data: Vec<f32> = match zbuffer {
+            Some(z) => {
+                assert_eq!(z.len(), n, "zbuffer length {} != width*height {}", z.len(), n);
+                z.to_vec()
+            }
+            None => vec![f32::INFINITY; n],
+        };
+        let zbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    Some("vol_zbuffer"),
+            contents: cast_slice(&zbuf_data),
+            usage:    wgpu::BufferUsages::STORAGE,
         });
 
         // Bind group layout.
@@ -374,6 +443,16 @@ impl<'ctx> GpuPhotonFilm<'ctx> {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding:    7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty:                 wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size:   None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -403,6 +482,7 @@ impl<'ctx> GpuPhotonFilm<'ctx> {
                 wgpu::BindGroupEntry { binding: 4, resource: tables_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: film_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: debug_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: zbuf.as_entire_binding() },
             ],
         });
 
@@ -426,26 +506,54 @@ impl<'ctx> GpuPhotonFilm<'ctx> {
         }
     }
 
-    /// Dispatch the photon kernel (normal splat path), then resolve into the
-    /// f32 accumulator. Debug recording is OFF.
+    /// Max photons per single dispatch (workgroup_size 64 ×
+    /// max_compute_workgroups_per_dimension 65535 ≈ 4.19M). Stay safely under it.
+    pub const MAX_PER_DISPATCH: u32 = 4_000_000;
+
+    /// Dispatch the photon kernel (normal splat path) in a SINGLE dispatch, then
+    /// resolve into the f32 accumulator. Debug recording is OFF. `n_photons` must
+    /// be <= MAX_PER_DISPATCH; use `trace_chunked` for larger counts.
     pub fn trace_and_resolve(&mut self, n_photons: u32, seed: u32) {
+        self.dispatch_chunk(0, n_photons, seed);
+        self.resolve();
+    }
+
+    /// Dispatch many photons across several chunks (each <= MAX_PER_DISPATCH),
+    /// resolving into the persistent f32 accumulator after each, so a large
+    /// photon count (e.g. 16M) stays under the Metal watchdog. Splat path only.
+    pub fn trace_chunked(&mut self, total_photons: u32, seed: u32) {
+        let mut base = 0u32;
+        while base < total_photons {
+            let this = (total_photons - base).min(Self::MAX_PER_DISPATCH);
+            self.dispatch_chunk(base, total_photons, seed);
+            self.resolve();
+            base += this;
+        }
+    }
+
+    /// Dispatch one chunk [photon_base, n_photons) of the splat path (no debug).
+    fn dispatch_chunk(&mut self, photon_base: u32, n_photons: u32, seed: u32) {
         self.params.n_photons   = n_photons;
         self.params.seed        = seed;
         self.params.debug_mode  = 0;
         self.params.debug_count = 0;
+        self.params.photon_base = photon_base;
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
 
+        let count = (n_photons - photon_base).min(Self::MAX_PER_DISPATCH);
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            let groups = n_photons.div_ceil(64);
+            let groups = count.div_ceil(64);
             pass.dispatch_workgroups(groups, 1, 1);
         }
         self.queue.submit([enc.finish()]);
+    }
 
-        // Resolve: read back film, accumulate, clear.
+    /// Resolve: read back the u32 film, divide by SCALE, add into accum, clear film.
+    fn resolve(&mut self) {
         let raw = self.read_film_raw();
         for (i, v) in raw.iter().enumerate() {
             self.accum[i] += *v as f32 / SCALE;
@@ -473,6 +581,7 @@ impl<'ctx> GpuPhotonFilm<'ctx> {
         self.params.seed        = seed;
         self.params.debug_mode  = 1;
         self.params.debug_count = debug_count;
+        self.params.photon_base = 0;
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
 
         let mut enc = self.device.create_command_encoder(&Default::default());
@@ -586,6 +695,36 @@ pub mod tests {
         // A mismatch would corrupt the GPU debug readback silently.
         assert_eq!(std::mem::size_of::<DebugPhotonGpu>(), 304);
         assert_eq!(std::mem::size_of::<DebugPhotonGpu>() % 16, 0);
+    }
+
+    #[test]
+    fn phase_hg_matches_cpu_oracle() {
+        // phase_hg_wgsl_mirror replicates the WGSL phase_hg op-for-op. volume.rs's
+        // phase_hg is private, so compare against a local copy of its EXACT formula
+        // (volume.rs lines 87-91). The WGSL compilation correctness is then implicit
+        // in vol_diff_gate passing (which uses the real WGSL phase_hg).
+        fn cpu_oracle_phase_hg(g: f32, cos_theta: f32) -> f32 {
+            let g2 = g * g;
+            let denom = (1.0 + g2 - 2.0 * g * cos_theta).max(1e-6).powf(1.5);
+            (1.0 - g2) / (4.0 * std::f32::consts::PI * denom)
+        }
+        let cases = [
+            (0.0_f32,  0.5_f32), (0.0, -0.5),
+            (0.5,  1.0), (0.5, -1.0), (0.5, 0.0),
+            (0.9,  1.0), (0.9, -1.0), (0.9, 0.0),
+            (0.6,  1.0), (-0.3, 0.7),
+        ];
+        let mut max_delta = 0.0f32;
+        for (g, c) in cases {
+            let m = phase_hg_wgsl_mirror(g, c);
+            let o = cpu_oracle_phase_hg(g, c);
+            let d = (m - o).abs();
+            max_delta = max_delta.max(d);
+            assert!(d < 1e-5, "phase_hg(g={g}, cos={c}): mirror {m} vs oracle {o}, delta {d}");
+        }
+        // Forward-bias invariant (mirrors volume.rs hg_forward_biased).
+        assert!(phase_hg_wgsl_mirror(0.6, 1.0) > phase_hg_wgsl_mirror(0.6, -1.0));
+        eprintln!("phase_hg_matches_cpu_oracle: max delta over {} cases = {max_delta:.3e}", cases.len());
     }
 
     /// Build the exact prism_dsotm.rs scene + beam + camera.
@@ -892,6 +1031,7 @@ pub mod tests {
 
         let mut film = GpuPhotonFilm::new(
             &ctx, scene, &cam, &beam, w, h, n_photons, seed, max_dist,
+            VolWeights::default(), None,
         );
         film.trace_and_resolve(n_photons, seed);
 
@@ -922,11 +1062,13 @@ pub mod tests {
 
         let mut film_a = GpuPhotonFilm::new(
             &ctx, scene_a, &cam_a, &beam_a, w, h, n_photons, seed, max_dist,
+            VolWeights::default(), None,
         );
         film_a.trace_and_resolve(n_photons, seed);
 
         let mut film_b = GpuPhotonFilm::new(
             &ctx, scene_b, &cam_b, &beam_b, w, h, n_photons, seed, max_dist,
+            VolWeights::default(), None,
         );
         film_b.trace_and_resolve(n_photons, seed);
 
@@ -999,6 +1141,7 @@ pub mod tests {
         let (scene, _b, cam) = dsotm_scene();
         let mut film = GpuPhotonFilm::new(
             ctx, scene, &cam, beam, w, h, n_photons, seed, max_dist,
+            VolWeights::default(), None,
         );
         let gpu_recs = film.trace_debug(n_photons, seed, debug_count);
         assert_eq!(gpu_recs.len(), debug_count as usize, "[{label}] debug readback count mismatch");
@@ -1118,5 +1261,98 @@ pub mod tests {
             "  [tir] TIR probe: photon {ti} λ={tl:.1}nm took a TIR bounce ({tbc} states); \
              GPU bounce count == CPU through the TIR fallback"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // VOL-4: full-image diff gate. The GPU weighted film vs the CPU oracle
+    // render_volumetric_scene, on the DSOTM scene, fixed N + seed + all-INF
+    // zbuffer + DSOTM weights. Per-photon paths are bit-identical (VOL-2) and
+    // GPU accumulation is deterministic fixed-point, so the only deltas are
+    // (a) ×4096 quantization and (b) CMF table vs Sensor::cmf (cross-validated
+    // by the backward GPU-7 gate). Expect very close agreement.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn vol_diff_gate() {
+        use spectral_core::volume::render_volumetric_scene;
+
+        let Some(ctx) = GpuContext::new() else {
+            eprintln!("no GPU; skipping vol_diff_gate (no GPU adapter)");
+            return;
+        };
+
+        let (w, h) = (200usize, 200usize);
+        let n_photons = 1_500_000u32;
+        let seed = 7u32;
+        let max_dist = 14.0_f32;
+        let weights = VolWeights::default(); // sigma_s=0.5, sigma_t=0.06, g=0.5
+        let zbuf = vec![f32::INFINITY; w * h];
+
+        // GPU.
+        let (scene_gpu, beam, cam) = dsotm_scene();
+        let mut film = GpuPhotonFilm::new(
+            &ctx, scene_gpu, &cam, &beam, w, h, n_photons, seed, max_dist,
+            weights, Some(&zbuf),
+        );
+        film.trace_and_resolve(n_photons, seed);
+        let gpu = film.accum(); // interleaved XYZ, length 3*w*h
+
+        // CPU oracle.
+        let (scene_cpu, beam_cpu, cam_cpu) = dsotm_scene();
+        let cpu = render_volumetric_scene(
+            &scene_cpu, &cam_cpu, &beam_cpu, w, h, n_photons,
+            weights.sigma_s, weights.sigma_t, weights.g, max_dist, &zbuf, seed,
+        ); // Vec<[f32;3]>
+
+        // Per-pixel relative L1 over the image (sum|gpu-cpu| / sum|cpu|, summed
+        // over all channels) + total-energy delta on the Y channel.
+        let mut abs_diff = 0.0f64;
+        let mut abs_cpu  = 0.0f64;
+        let mut gpu_y = 0.0f64;
+        let mut cpu_y = 0.0f64;
+        let mut max_pixel_rel = 0.0f64; // worst single-pixel rel error among bright pixels
+        let mut gpu_nonzero = 0usize;
+        let mut cpu_nonzero = 0usize;
+        for i in 0..w * h {
+            for c in 0..3 {
+                let g = gpu[3 * i + c] as f64;
+                let o = cpu[i][c] as f64;
+                abs_diff += (g - o).abs();
+                abs_cpu  += o.abs();
+            }
+            let gy = gpu[3 * i + 1] as f64;
+            let oy = cpu[i][1] as f64;
+            gpu_y += gy;
+            cpu_y += oy;
+            if gpu[3 * i] > 0.0 || gpu[3 * i + 1] > 0.0 || gpu[3 * i + 2] > 0.0 { gpu_nonzero += 1; }
+            if cpu[i][0] > 0.0 || cpu[i][1] > 0.0 || cpu[i][2] > 0.0 { cpu_nonzero += 1; }
+            // Only consider pixels with meaningful CPU energy for per-pixel rel.
+            if oy > 1e-3 {
+                let r = (gy - oy).abs() / oy;
+                if r > max_pixel_rel { max_pixel_rel = r; }
+            }
+        }
+        let rel_l1 = if abs_cpu > 0.0 { abs_diff / abs_cpu } else { 0.0 };
+        let energy_delta = if cpu_y > 0.0 { (gpu_y - cpu_y).abs() / cpu_y } else { 0.0 };
+
+        eprintln!(
+            "vol_diff_gate: {n_photons} photons, {w}x{h}, seed={seed}\n  \
+             relative L1 = {:.4}% (abs_diff={abs_diff:.3}, abs_cpu={abs_cpu:.3})\n  \
+             energy delta (Y) = {:.4}% (gpu_Y={gpu_y:.3}, cpu_Y={cpu_y:.3})\n  \
+             worst bright-pixel rel = {:.4}%\n  \
+             nonzero pixels: GPU={gpu_nonzero} CPU={cpu_nonzero} (should be ~equal if no underflow)",
+            rel_l1 * 100.0, energy_delta * 100.0, max_pixel_rel * 100.0
+        );
+
+        // Sanity: the CPU oracle produced energy (the scene isn't black).
+        assert!(cpu_y > 0.0, "CPU oracle produced zero Y energy; scene/beam misconfigured");
+
+        // GPU-7 discipline: relative L1 < 1%, energy within 1%. (Actuals are much
+        // tighter; see the printed numbers. Do NOT loosen to pass — a 3%+ result
+        // means a weight term is wrong.)
+        assert!(rel_l1 < 0.01,
+            "vol_diff_gate relative L1 {:.4}% exceeds 1% — a weight term (phase angle, /d², \
+             seg_len/4, sigma) is likely wrong", rel_l1 * 100.0);
+        assert!(energy_delta < 0.01,
+            "vol_diff_gate energy delta {:.4}% exceeds 1%", energy_delta * 100.0);
     }
 }

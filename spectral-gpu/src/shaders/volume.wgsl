@@ -1,7 +1,8 @@
-// VOL-2: Forward photon kernel — forward light tracing with dispersion.
+// VOL-2/3: Forward photon kernel — forward light tracing with dispersion and
+// full single-scatter camera-connection weighting.
 //
 // One GPU thread per photon. Mirrors render_volumetric_scene() from volume.rs
-// EXACTLY, including RNG consumption order (load-bearing for VOL-4 parity gate).
+// EXACTLY, including RNG consumption order (load-bearing for the VOL-4 diff gate).
 //
 // RNG order per photon i:
 //   rng = rng_new(i, seed)
@@ -11,7 +12,15 @@
 //   4. per bounce: 4x next_f32() for seg sample distances (SEG_SAMPLES=4)
 //   5. per hit:    scatter() consumes 1 Fresnel roulette draw (dielectric)
 //
-// VOL-2 splat weight: DOT_WEIGHT constant (no phase/transmittance/d² — VOL-3).
+// VOL-3 splat weight (mirrors volume.rs render_volumetric_scene lines 129-149):
+//   to = camO - p;  d = max(length(to), 1e-3)
+//   if d < zbuffer[py*w+px] {           // DSOTM = all-INF zbuffer -> always pass
+//     cos_theta = dot(ray.dir, to/d)    // scatter->camera vector, NOT cam forward
+//     phase = phase_hg(g, cos_theta)
+//     trans = exp(-sigma_t * d)
+//     contrib = power*sigma_s*phase*trans/(d*d) * seg_len/SEG_SAMPLES
+//     splat (xb,yb,zb)*contrib
+//   }
 //
 // Prepended at build time with rng.wgsl (pcg32/PathRng/rng_new/rng_next_u32/rng_next_f32).
 
@@ -24,10 +33,14 @@ const LAMBDA_RANGE: f32 = 350.0;
 const N_SAMPLES:    u32 = 71u;
 const LAMBDA0:      f32 = 380.0;
 const LAMBDA_STEP:  f32 = 5.0;
-const SCALE:        f32 = 4096.0;
-
-// VOL-2: flat dot weight (no volumetric weighting yet)
-const DOT_WEIGHT:   f32 = 0.02;
+// Fixed-point accumulation scale = 2^23. VOL-3 weighted contributions are tiny
+// (CMF · phase · trans / d² ~ 1e-5..1e-7 per splat); 2^12 (VOL-1) underflowed them
+// to zero (diff gate L1 92%). Empirically L1 scales ~1/SCALE: 2^20 -> 1.97%,
+// 2^23 -> 0.28%. 2^23 keeps the diff gate <1% with headroom while peak pixel u32
+// (~a few units × 2^23 ≈ 2-4e7, ~4e8 at 16M photons) stays well below u32::MAX
+// (4.29e9). MUST match SCALE in vol_photons.rs (load-bearing for the diff gate).
+const SCALE:        f32 = 8388608.0;
+const SEG_SAMPLES:  f32 = 4.0;
 
 // ---------------------------------------------------------------------------
 // GPU structs — identical byte layout to upload.rs / trace.wgsl
@@ -76,6 +89,11 @@ struct VolParams {
     cam_u:        vec4<f32>,  // xyz = horizontal.normalize(), w = horizontal.length()
     cam_v:        vec4<f32>,  // xyz = vertical.normalize(),   w = vertical.length()
     cam_w:        vec4<f32>,  // xyz = origin - horiz/2 - vert/2 - lower_left (the "w" vector)
+    // VOL-3 single-scatter weight parameters
+    sigma_s:      f32,
+    sigma_t:      f32,
+    g:            f32,
+    photon_base:  u32,        // chunking: photon i = photon_base + gid.x
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +125,11 @@ struct DebugPhoton {
     states:     array<vec4<f32>, 18>,
 }
 @group(0) @binding(6) var<storage, read_write> debug_out: array<DebugPhoton>;
+
+// zbuffer: per-pixel nearest-solid euclidean depth; a scatter point splats only
+// if its camera distance d < zbuffer[py*w+px]. DSOTM uses an all-INF zbuffer
+// (no occlusion -> always pass).
+@group(0) @binding(7) var<storage, read>       zbuffer:   array<f32>;
 
 // Record the (origin, dir) pair at slot `pair_idx` for debug photon `idx`.
 fn debug_record(idx: u32, pair_idx: u32, origin: vec3<f32>, dir: vec3<f32>) {
@@ -384,10 +407,23 @@ fn scatter(mat: GpuMaterial, wo_in: vec3<f32>, hit: Hit, n_hero: f32, rng: ptr<f
 }
 
 // ---------------------------------------------------------------------------
+// Henyey-Greenstein phase function — mirrors volume.rs::phase_hg EXACTLY.
+//   denom = max(1 + g² - 2·g·cos, 1e-6)^1.5   (clamp BEFORE pow)
+//   p     = (1 - g²) / (4π · denom)
+// ---------------------------------------------------------------------------
+fn phase_hg(g: f32, cos_theta: f32) -> f32 {
+    let g2    = g * g;
+    let denom = pow(max(1.0 + g2 - 2.0 * g * cos_theta, 1e-6), 1.5);
+    return (1.0 - g2) / (4.0 * PI * denom);
+}
+
+// ---------------------------------------------------------------------------
 // Film splat
 // ---------------------------------------------------------------------------
 fn film_splat(idx: u32, xyz: vec3<f32>) {
-    let x = max(xyz, vec3<f32>(0.0)) * SCALE;
+    // Clamp to [0, 4e9] before the u32 cast: negatives are nonsense and a huge
+    // float -> u32 is implementation-defined. 4e9 < u32::MAX is wrap-safe.
+    let x = clamp(xyz * SCALE, vec3<f32>(0.0), vec3<f32>(4.0e9));
     atomicAdd(&film[3u * idx + 0u], u32(x.x));
     atomicAdd(&film[3u * idx + 1u], u32(x.y));
     atomicAdd(&film[3u * idx + 2u], u32(x.z));
@@ -440,7 +476,8 @@ fn camera_project(p: vec3<f32>) -> vec3<f32> {
 // ---------------------------------------------------------------------------
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let photon_idx = gid.x;
+    // Chunking: global photon index = photon_base + local thread index.
+    let photon_idx = params.photon_base + gid.x;
     if photon_idx >= params.n_photons {
         return;
     }
@@ -482,17 +519,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let sh      = scene_intersect(ro, rd);
         let seg_len = select(params.max_dist, sh.hit.t, sh.any);
 
-        // Mirror: for _ in 0..SEG_SAMPLES (=4) — CONSUME rng draws even if not on-screen
+        // Mirror render_volumetric_scene lines 129-149: for _ in 0..SEG_SAMPLES.
+        // CONSUME the rng draw regardless of on-screen / occlusion (RNG order is
+        // load-bearing for the diff gate).
         for (var k = 0u; k < 4u; k = k + 1u) {
-            let dist = rng_next_f32(&rng) * seg_len;  // consume the draw regardless
+            let dist = rng_next_f32(&rng) * seg_len;
             let p    = ro + rd * dist;
             let proj = camera_project(p);
             if proj.x >= 0.0 {
-                // On-screen: VOL-2 splat (no phase/transmittance/d²)
-                let px  = u32(proj.x * f32(w));
-                let py  = u32((1.0 - proj.y) * f32(h));
-                let idx = min(py, h - 1u) * w + min(px, w - 1u);
-                film_splat(idx, xyz_cmf * (power * DOT_WEIGHT));
+                let px  = min(u32(proj.x * f32(w)), w - 1u);
+                let py  = min(u32((1.0 - proj.y) * f32(h)), h - 1u);
+                let pidx = py * w + px;
+
+                // Full single-scatter camera-connection weight.
+                let to = params.cam_origin.xyz - p;
+                let d  = max(length(to), 1e-3);
+                if d < zbuffer[pidx] {
+                    let cos_theta = dot(rd, to / d);
+                    let phase     = phase_hg(params.g, cos_theta);
+                    let trans     = exp(-params.sigma_t * d);
+                    let contrib   = power * params.sigma_s * phase * trans / (d * d)
+                                    * seg_len / SEG_SAMPLES;
+                    film_splat(pidx, xyz_cmf * contrib);
+                }
             }
         }
 

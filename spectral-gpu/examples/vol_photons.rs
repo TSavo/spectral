@@ -68,9 +68,13 @@ fn main() {
         WIDTH, HEIGHT, N_PHOTONS, SEED
     );
 
+    // NOTE: since VOL-3 the kernel applies the full single-scatter weight, so this
+    // now renders the weighted fan (not the VOL-2 unit-weight constellation). The
+    // dedicated VOL-3 eyeball example is vol_fan.rs.
     let mut film = GpuPhotonFilm::new(
         &ctx, scene, &cam, &beam,
         WIDTH, HEIGHT, N_PHOTONS, SEED, MAX_DIST,
+        spectral_gpu::vol_photons::VolWeights::default(), None,
     );
 
     film.trace_and_resolve(N_PHOTONS, SEED);

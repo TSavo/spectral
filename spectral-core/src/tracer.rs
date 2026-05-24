@@ -14,7 +14,7 @@ pub struct CpuTracer {
     camera: Camera,
     sensor: Sensor,
     illuminant: Illuminant,
-    seed: u64,
+    seed: u32,
     accum: AccumBuffer,
     max_bounces: u32,
 }
@@ -27,7 +27,7 @@ impl CpuTracer {
         width: usize,
         height: usize,
         illuminant: Illuminant,
-        seed: u64,
+        seed: u32,
     ) -> Self {
         CpuTracer {
             scene,
@@ -44,10 +44,10 @@ impl CpuTracer {
     fn sample_pixel(&self, px: usize, py: usize, sample_idx: u32) -> [f32; 3] {
         let w = self.accum.width;
         let h = self.accum.height;
-        // Stream key: pixel index in the high bits, sample index in the low 20.
-        // Clean XOR separation holds while sample_idx < 2^20 (1M samples/pixel),
-        // which is never a practical limit.
-        let key = (((py * w + px) as u64) << 20) ^ sample_idx as u64;
+        // Stream key: mix pixel index and sample index via mix2, which uses two
+        // rounds of the PCG hash for collision resistance. Pure u32; mirrors WGSL.
+        let pixel = (py * w + px) as u32;
+        let key = crate::rng::mix2(pixel, sample_idx);
         let mut rng = PathRng::new(key, self.seed);
 
         let s = (px as f32 + rng.next_f32()) / w as f32;

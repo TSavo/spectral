@@ -154,9 +154,9 @@ pub fn trace_photon(
 
 /// Emit `n` photons from the beam (wavelengths uniform over the visible band) and
 /// splat survivors onto the screen.
-pub fn trace(scene: &Scene, screen: &mut Screen, beam: &Beam, n: u32, seed: u64) {
+pub fn trace(scene: &Scene, screen: &mut Screen, beam: &Beam, n: u32, seed: u32) {
     for i in 0..n {
-        let mut rng = PathRng::new(i as u64, seed);
+        let mut rng = PathRng::new(i, seed);
         let origin = beam.corner + beam.u * rng.next_f32() + beam.v * rng.next_f32();
         let lambda = LAMBDA_MIN + LAMBDA_RANGE * rng.next_f32();
         if let Some((s, r, power)) = trace_photon(scene, screen, Ray { origin, dir: beam.dir }, lambda, &mut rng) {
@@ -176,7 +176,7 @@ mod tests {
     fn mean_landing(scene: &Scene, screen: &Screen, beam: &Beam, lambda: f32, n: u32) -> Option<(f32, f32)> {
         let (mut sx, mut sr, mut cnt) = (0.0f32, 0.0f32, 0u32);
         for i in 0..n {
-            let mut rng = PathRng::new(i as u64, 1);
+            let mut rng = PathRng::new(i, 1);
             let origin = beam.corner + beam.u * rng.next_f32() + beam.v * rng.next_f32();
             if let Some((s, r, _)) = trace_photon(scene, screen, Ray { origin, dir: beam.dir }, lambda, &mut rng) {
                 sx += s; sr += r; cnt += 1;

@@ -27,7 +27,7 @@ pub fn render_volumetric(
     n_photons: u32,
     sigma_s: f32,
     max_dist: f32,
-    seed: u64,
+    seed: u32,
 ) -> Vec<Xyz> {
     let sensor = Sensor::new();
     let mut img = vec![[0.0f32; 3]; width * height];
@@ -35,7 +35,7 @@ pub fn render_volumetric(
     const INV_4PI: f32 = 1.0 / (4.0 * std::f32::consts::PI);
 
     for i in 0..n_photons {
-        let mut rng = PathRng::new(i as u64, seed);
+        let mut rng = PathRng::new(i, seed);
         let origin = beam.corner + beam.u * rng.next_f32() + beam.v * rng.next_f32();
         let lambda = LAMBDA_MIN + LAMBDA_RANGE * rng.next_f32();
         let (xb, yb, zb) = sensor.cmf(lambda);
@@ -107,7 +107,7 @@ pub fn render_volumetric_scene(
     g: f32,
     max_dist: f32,
     zbuffer: &[f32],
-    seed: u64,
+    seed: u32,
 ) -> Vec<Xyz> {
     let sensor = Sensor::new();
     let cam_o = camera.origin();
@@ -115,7 +115,7 @@ pub fn render_volumetric_scene(
     const SEG_SAMPLES: u32 = 4;
 
     for i in 0..n_photons {
-        let mut rng = PathRng::new(i as u64, seed);
+        let mut rng = PathRng::new(i, seed);
         let origin = beam.corner + beam.u * rng.next_f32() + beam.v * rng.next_f32();
         let lambda = LAMBDA_MIN + LAMBDA_RANGE * rng.next_f32();
         let (xb, yb, zb) = sensor.cmf(lambda);

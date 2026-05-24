@@ -1,6 +1,7 @@
 //! GPU mirror of the CPU spectral path tracer.
 
 pub mod data;
+pub mod film;
 pub mod upload;
 
 use bytemuck::{Pod, Zeroable};

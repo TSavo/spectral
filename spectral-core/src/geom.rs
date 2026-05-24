@@ -18,7 +18,10 @@ impl Ray {
 pub struct Hit {
     pub t: f32,
     pub point: Vec3,
-    pub normal: Vec3, // unit, oriented to face the incoming ray
+    /// Unit normal, oriented to face the incoming ray.
+    pub normal: Vec3,
+    /// True if the ray hit the outward side of the surface (entering the solid).
+    pub front_face: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -47,11 +50,10 @@ impl Sphere {
             }
         }
         let point = r.at(t);
-        let mut normal = (point - self.center) / self.radius;
-        if normal.dot(r.dir) > 0.0 {
-            normal = -normal;
-        }
-        Some(Hit { t, point, normal })
+        let outward = (point - self.center) / self.radius;
+        let front_face = outward.dot(r.dir) < 0.0;
+        let normal = if front_face { outward } else { -outward };
+        Some(Hit { t, point, normal, front_face })
     }
 }
 
@@ -149,11 +151,9 @@ impl ConvexSolid {
         if t_hit > t_max {
             return None;
         }
-        let mut normal = hit_normal;
-        if normal.dot(r.dir) > 0.0 {
-            normal = -normal;
-        }
-        Some(Hit { t: t_hit, point: r.at(t_hit), normal })
+        let front_face = hit_normal.dot(r.dir) < 0.0;
+        let normal = if front_face { hit_normal } else { -hit_normal };
+        Some(Hit { t: t_hit, point: r.at(t_hit), normal, front_face })
     }
 }
 
@@ -249,5 +249,16 @@ mod tests {
         let prism = ConvexSolid::triangular_prism(1.0, 2.0);
         let r = Ray { origin: Vec3::new(5.0, 5.0, 0.0), dir: -Vec3::Y };
         assert!(prism.intersect(&r, 1e-4, f32::INFINITY).is_none());
+    }
+
+    #[test]
+    fn front_face_flags_entry_vs_exit() {
+        let cube = ConvexSolid::axis_box(Vec3::splat(-1.0), Vec3::splat(1.0));
+        // Outside origin entering the +Z face: front_face true.
+        let r_in = Ray { origin: Vec3::new(0.0, 0.0, 5.0), dir: -Vec3::Z };
+        assert!(cube.intersect(&r_in, 1e-4, f32::INFINITY).unwrap().front_face);
+        // Interior origin reaching the exit face: front_face false.
+        let r_out = Ray { origin: Vec3::ZERO, dir: Vec3::Z };
+        assert!(!cube.intersect(&r_out, 1e-4, f32::INFINITY).unwrap().front_face);
     }
 }

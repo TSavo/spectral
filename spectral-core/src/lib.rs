@@ -2,6 +2,7 @@
 
 pub mod cie;
 pub mod geom;
+pub mod material;
 pub mod optics;
 pub mod rng;
 pub mod sellmeier;

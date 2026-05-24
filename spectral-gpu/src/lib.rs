@@ -3,6 +3,7 @@
 pub mod data;
 pub mod film;
 pub mod upload;
+pub mod vol_photons;
 
 use bytemuck::{Pod, Zeroable};
 use spectral_core::camera::Camera;

@@ -64,8 +64,8 @@ struct VolParams {
     // image
     width:        u32,
     height:       u32,
-    _pad0:        u32,
-    _pad1:        u32,
+    debug_mode:   u32,  // 0 = normal splat only; 1 = also record per-photon state
+    debug_count:  u32,  // photons with idx < debug_count get their state recorded
     // beam: corner, u, v, dir as vec4 (xyz+pad)
     beam_corner:  vec4<f32>,
     beam_u:       vec4<f32>,
@@ -89,6 +89,32 @@ struct VolParams {
 @group(0) @binding(4) var<storage, read>       tables:     array<f32>;
 // film: 3 * width * height atomic<u32> (XYZ interleaved, channel c at 3*idx+c)
 @group(0) @binding(5) var<storage, read_write> film:       array<atomic<u32>>;
+
+// DEBUG: per-photon recorded state for the GPU-vs-CPU parity gate.
+// Mirrors cpu_simulate_photon's ray_states: one (origin,dir) pair pushed before
+// the bounce loop, then one more after each SUCCESSFUL scatter (max 9 pairs).
+// Layout per photon (must match DebugPhotonGpu in vol_photons.rs, 304 bytes):
+//   num_states: u32   (= 1 + successful scatters)
+//   lambda:     f32
+//   _pad:       vec2<u32>
+//   states:     array<vec4<f32>, 18>  // 9 pairs: (origin.xyz,_)(dir.xyz,_)
+const MAX_PAIRS: u32 = 9u;
+struct DebugPhoton {
+    num_states: u32,
+    lambda:     f32,
+    _pad0:      u32,
+    _pad1:      u32,
+    states:     array<vec4<f32>, 18>,
+}
+@group(0) @binding(6) var<storage, read_write> debug_out: array<DebugPhoton>;
+
+// Record the (origin, dir) pair at slot `pair_idx` for debug photon `idx`.
+fn debug_record(idx: u32, pair_idx: u32, origin: vec3<f32>, dir: vec3<f32>) {
+    if pair_idx >= MAX_PAIRS { return; }
+    debug_out[idx].states[2u * pair_idx + 0u] = vec4<f32>(origin, 0.0);
+    debug_out[idx].states[2u * pair_idx + 1u] = vec4<f32>(dir,    0.0);
+    debug_out[idx].num_states = pair_idx + 1u; // running count of pairs written
+}
 
 // ---------------------------------------------------------------------------
 // Shared helpers — VALIDATED copies from trace.wgsl (do not rewrite)
@@ -442,6 +468,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w = params.width;
     let h = params.height;
 
+    let do_debug = params.debug_mode == 1u && photon_idx < params.debug_count;
+
+    // CPU mirror: ray_states starts with (origin, beam_dir) pushed BEFORE the loop.
+    var n_pairs = 1u;
+    if do_debug {
+        debug_out[photon_idx].lambda = lambda;
+        debug_record(photon_idx, 0u, origin, rd); // pair 0 = (origin, beam_dir)
+    }
+
     // Mirror: for _ in 0..8 bounce loop
     for (var bounce = 0u; bounce < 8u; bounce = bounce + 1u) {
         let sh      = scene_intersect(ro, rd);
@@ -482,5 +517,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         power *= sc.weight;
         ro     = sh.hit.point;
         rd     = sc.dir;
+
+        // CPU mirror: after a successful scatter, ray_states.push((h.point, sc.dir)).
+        if do_debug {
+            debug_record(photon_idx, n_pairs, ro, rd);
+            n_pairs = n_pairs + 1u;
+        }
     }
 }

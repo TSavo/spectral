@@ -574,3 +574,59 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// VOL-5: surface rim pass — deterministic backward pass, one thread per pixel.
+// Mirrors prism_dsotm.rs SURFACE PASS (lines ~56-74) EXACTLY:
+//   s = (px+0.5)/w;  t = 1 - (py+0.5)/h
+//   ray = camera.primary_ray(s, t)
+//   if scene.intersect(ray) {
+//     cos = abs(clamp(dot(hit.normal, ray.dir), 0, 1))   // = |normal·dir|, clamped
+//     rim = (1 - cos)^2
+//     xyz = [0.015 + rim*0.45, 0.02 + rim*0.5, 0.04 + rim*0.6]
+//   } else { 0 }
+// Writes to the SAME atomic film (one write per pixel, no contention); the host
+// resolves it into a SEPARATE f32 surface buffer (NOT the volumetric accum), so
+// the static rim composites with the progressive fan at display time.
+//
+// Camera basis reconstructed from VolParams (byte-identical to Camera::look_at):
+//   horizontal = cam_u.xyz * cam_u.w     (unit dir * original length)
+//   vertical   = cam_v.xyz * cam_v.w
+//   lower_left = origin - horizontal/2 - vertical/2 - cam_w.xyz
+// ---------------------------------------------------------------------------
+@compute @workgroup_size(8, 8)
+fn rim_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = params.width;
+    let h = params.height;
+    if gid.x >= w || gid.y >= h {
+        return;
+    }
+    let px = gid.x;
+    let py = gid.y;
+
+    // primary_ray(s, t): mirrors Camera::primary_ray.
+    let horizontal = params.cam_u.xyz * params.cam_u.w;
+    let vertical   = params.cam_v.xyz * params.cam_v.w;
+    let lower_left = params.cam_origin.xyz - horizontal * 0.5 - vertical * 0.5 - params.cam_w.xyz;
+    let s   = (f32(px) + 0.5) / f32(w);
+    let t   = 1.0 - (f32(py) + 0.5) / f32(h);
+    let ro  = params.cam_origin.xyz;
+    let rd  = normalize(lower_left + s * horizontal + t * vertical - ro);
+
+    let pidx = py * w + px;
+
+    let sh = scene_intersect(ro, rd);
+    if sh.any {
+        // cos = hit.normal.dot(ray.dir).abs().clamp(0, 1)
+        let cos = clamp(abs(dot(sh.hit.normal, rd)), 0.0, 1.0);
+        let one_minus = 1.0 - cos;
+        let rim = one_minus * one_minus; // (1 - cos)^2
+        let xyz = vec3<f32>(
+            0.015 + rim * 0.45,
+            0.02  + rim * 0.5,
+            0.04  + rim * 0.6,
+        );
+        film_splat(pidx, xyz);
+    }
+    // else: background [0,0,0] — write nothing (film was cleared before dispatch).
+}

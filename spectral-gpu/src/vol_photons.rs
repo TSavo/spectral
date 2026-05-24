@@ -185,6 +185,7 @@ pub struct GpuPhotonFilm<'ctx> {
     device:        &'ctx wgpu::Device,
     queue:         &'ctx wgpu::Queue,
     pipeline:      wgpu::ComputePipeline,
+    rim_pipeline:  wgpu::ComputePipeline,
     bind_group:    wgpu::BindGroup,
     params:        VolParamsGpu,
     params_buf:    wgpu::Buffer,
@@ -194,6 +195,10 @@ pub struct GpuPhotonFilm<'ctx> {
     debug_read:    wgpu::Buffer,
     debug_capacity: u32,
     accum:         Vec<f32>,
+    /// Static per-camera surface rim (3*w*h interleaved XYZ). Composited with
+    /// `accum` at display (to_rgb8), NOT folded into the progressive accum.
+    /// Zeroed until recompute_surface() is called. VOL-6 recomputes on camera move.
+    surface:       Vec<f32>,
     pub width:     usize,
     pub height:    usize,
 }
@@ -471,6 +476,16 @@ impl<'ctx> GpuPhotonFilm<'ctx> {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
+        // VOL-5 surface rim pass — same module + layout, different entry point.
+        let rim_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label:       Some("vol_rim"),
+            layout:      Some(&pipeline_layout),
+            module:      &module,
+            entry_point: "rim_main",
+            cache:       None,
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label:   Some("vol_bg"),
             layout:  &bgl,
@@ -487,11 +502,13 @@ impl<'ctx> GpuPhotonFilm<'ctx> {
         });
 
         let accum = vec![0.0f32; 3 * n];
+        let surface = vec![0.0f32; 3 * n];
 
         GpuPhotonFilm {
             device,
             queue,
             pipeline,
+            rim_pipeline,
             bind_group,
             params,
             params_buf,
@@ -501,6 +518,7 @@ impl<'ctx> GpuPhotonFilm<'ctx> {
             debug_read,
             debug_capacity: DEBUG_CAPACITY,
             accum,
+            surface,
             width,
             height,
         }
@@ -559,6 +577,50 @@ impl<'ctx> GpuPhotonFilm<'ctx> {
             self.accum[i] += *v as f32 / SCALE;
         }
         self.clear_film();
+    }
+
+    /// VOL-5: recompute the static surface-rim buffer for `camera` (one camera
+    /// primary ray per pixel, one prism intersection, the Fresnel-style rim term).
+    /// Mirrors prism_dsotm.rs SURFACE PASS. Overwrites `surface` (not additive); it
+    /// is composited with the progressive volumetric `accum` at display in to_rgb8.
+    ///
+    /// VOL-6 calls this on camera-move; the headless example calls it once. It does
+    /// NOT touch `accum`, and clears the shared film before and after so it can't
+    /// pollute a volumetric run.
+    pub fn recompute_surface(&mut self, camera: &Camera) {
+        // Update the camera basis in params (the rim kernel reconstructs primary_ray
+        // from cam_origin/cam_u/cam_v/cam_w).
+        let (cam_origin, cam_u, cam_v, cam_w) = camera_proj_params(camera);
+        self.params.cam_origin = cam_origin;
+        self.params.cam_u      = cam_u;
+        self.params.cam_v      = cam_v;
+        self.params.cam_w      = cam_w;
+        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+
+        // Dispatch the rim kernel into a freshly-cleared film.
+        self.clear_film();
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.rim_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            let gx = (self.width as u32).div_ceil(8);
+            let gy = (self.height as u32).div_ceil(8);
+            pass.dispatch_workgroups(gx, gy, 1);
+        }
+        self.queue.submit([enc.finish()]);
+
+        // Resolve into `surface` (overwrite, NOT additive), then clear the film.
+        let raw = self.read_film_raw();
+        for (i, v) in raw.iter().enumerate() {
+            self.surface[i] = *v as f32 / SCALE;
+        }
+        self.clear_film();
+    }
+
+    /// Borrow the static surface-rim buffer (3*w*h interleaved XYZ).
+    pub fn surface(&self) -> &[f32] {
+        &self.surface
     }
 
     /// Dispatch the photon kernel with debug recording ON for photons
@@ -651,21 +713,41 @@ impl<'ctx> GpuPhotonFilm<'ctx> {
         &self.accum
     }
 
-    /// Auto-expose from Y channel.
+    /// Composited XYZ for pixel `i` = volumetric accum + static surface rim.
+    /// This is the display image (mirrors prism_dsotm.rs `surface + vol`).
+    #[inline]
+    fn composited(&self, i: usize) -> [f32; 3] {
+        [
+            self.accum[3 * i]     + self.surface[3 * i],
+            self.accum[3 * i + 1] + self.surface[3 * i + 1],
+            self.accum[3 * i + 2] + self.surface[3 * i + 2],
+        ]
+    }
+
+    /// Auto-expose from the composited Y channel (max).
     pub fn auto_expose(&self, scale: f32) -> f32 {
         let n = self.width * self.height;
-        let max_y = (0..n).map(|i| self.accum[3 * i + 1]).fold(0.0f32, f32::max);
+        let max_y = (0..n).map(|i| self.composited(i)[1]).fold(0.0f32, f32::max);
         (scale / max_y.max(1e-6)).max(1.0)
     }
 
-    /// Tonemap the f32 accum to RGB8.
+    /// Auto-expose to the 99.7th-percentile composited luminance (mirrors the
+    /// exposure choice in prism_dsotm.rs: exposure = 1 / p99.7).
+    pub fn auto_expose_p997(&self) -> f32 {
+        let n = self.width * self.height;
+        let mut lums: Vec<f32> = (0..n).map(|i| self.composited(i)[1]).collect();
+        lums.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p = lums[((n as f32 * 0.997) as usize).min(n - 1)].max(1e-9);
+        1.0 / p
+    }
+
+    /// Tonemap the composited (volumetric + surface-rim) image to RGB8.
     pub fn to_rgb8(&self, exposure: f32) -> Vec<u8> {
         use spectral_core::cie::{tonemap_to_u8, xyz_to_linear_srgb};
         let n = self.width * self.height;
         let mut out = Vec::with_capacity(n * 3);
         for i in 0..n {
-            let xyz = [self.accum[3 * i], self.accum[3 * i + 1], self.accum[3 * i + 2]];
-            let linear = xyz_to_linear_srgb(xyz);
+            let linear = xyz_to_linear_srgb(self.composited(i));
             let rgb = tonemap_to_u8(linear, exposure);
             out.extend_from_slice(&rgb);
         }
@@ -1354,5 +1436,98 @@ pub mod tests {
              seg_len/4, sigma) is likely wrong", rel_l1 * 100.0);
         assert!(energy_delta < 0.01,
             "vol_diff_gate energy delta {:.4}% exceeds 1%", energy_delta * 100.0);
+    }
+
+    /// CPU replication of prism_dsotm.rs SURFACE PASS over ALL pixels.
+    /// Returns the interleaved XYZ surface buffer (3*w*h).
+    fn cpu_surface_rim(scene: &Scene, cam: &Camera, w: usize, h: usize) -> Vec<f32> {
+        let mut surface = vec![0.0f32; 3 * w * h];
+        for py in 0..h {
+            for px in 0..w {
+                let s = (px as f32 + 0.5) / w as f32;
+                let t = 1.0 - (py as f32 + 0.5) / h as f32;
+                let ray = cam.primary_ray(s, t);
+                let idx = py * w + px;
+                let xyz = if let Some((hit, _)) = scene.intersect(&ray) {
+                    let cos = hit.normal.dot(ray.dir).abs().clamp(0.0, 1.0);
+                    let rim = (1.0 - cos).powi(2);
+                    [0.015 + rim * 0.45, 0.02 + rim * 0.5, 0.04 + rim * 0.6]
+                } else {
+                    [0.0, 0.0, 0.0]
+                };
+                surface[3 * idx]     = xyz[0];
+                surface[3 * idx + 1] = xyz[1];
+                surface[3 * idx + 2] = xyz[2];
+            }
+        }
+        surface
+    }
+
+    // -----------------------------------------------------------------------
+    // VOL-5: surface rim gate. The rim pass is deterministic (no RNG): one camera
+    // primary ray per pixel, one prism intersection, a Fresnel-style rim term.
+    // The GPU surface buffer must match the CPU prism_dsotm surface loop pixel-for-
+    // pixel within 1e-4.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn surface_rim_matches_cpu() {
+        let Some(ctx) = GpuContext::new() else {
+            eprintln!("no GPU; skipping surface_rim_matches_cpu (no GPU adapter)");
+            return;
+        };
+
+        let (w, h) = (300usize, 300usize);
+        let (scene_gpu, beam, cam) = dsotm_scene();
+
+        // GPU rim pass: build the film, recompute surface (no photons traced).
+        let mut film = GpuPhotonFilm::new(
+            &ctx, scene_gpu, &cam, &beam, w, h, 1, 0, 14.0,
+            VolWeights::default(), None,
+        );
+        film.recompute_surface(&cam);
+        let gpu = film.surface();
+
+        // CPU replication.
+        let (scene_cpu, _b, cam_cpu) = dsotm_scene();
+        let cpu = cpu_surface_rim(&scene_cpu, &cam_cpu, w, h);
+
+        let mut max_delta = 0.0f32;
+        let mut worst = (0usize, 0usize, 0.0f32, 0.0f32);
+        let mut gpu_nonzero = 0usize;
+        let mut cpu_nonzero = 0usize;
+        for i in 0..w * h {
+            let g_any = gpu[3 * i] > 0.0 || gpu[3 * i + 1] > 0.0 || gpu[3 * i + 2] > 0.0;
+            let c_any = cpu[3 * i] > 0.0 || cpu[3 * i + 1] > 0.0 || cpu[3 * i + 2] > 0.0;
+            if g_any { gpu_nonzero += 1; }
+            if c_any { cpu_nonzero += 1; }
+            for c in 0..3 {
+                let d = (gpu[3 * i + c] - cpu[3 * i + c]).abs();
+                if d > max_delta {
+                    max_delta = d;
+                    worst = (i, c, gpu[3 * i + c], cpu[3 * i + c]);
+                }
+            }
+        }
+
+        eprintln!(
+            "surface_rim_matches_cpu: {w}x{h}, max per-pixel delta = {max_delta:.3e}\n  \
+             silhouette (nonzero) pixels: GPU={gpu_nonzero} CPU={cpu_nonzero}\n  \
+             worst pixel: idx={} ch={} GPU={} CPU={}",
+            worst.0, worst.1, worst.2, worst.3
+        );
+
+        // 1. Silhouette match (intersection-branch agreement, exact).
+        assert_eq!(
+            gpu_nonzero, cpu_nonzero,
+            "GPU silhouette {gpu_nonzero} != CPU {cpu_nonzero} — prism intersection disagrees on edge pixels"
+        );
+        // 2. Non-empty silhouette (sanity: camera/scene aren't a no-op).
+        assert!(cpu_nonzero > 0, "CPU surface is all-background; the prism isn't in frame");
+        // 3. Per-pixel agreement.
+        assert!(
+            max_delta < 1e-4,
+            "surface_rim max per-pixel delta {max_delta:.3e} >= 1e-4 — camera reconstruction \
+             or rim formula drifted from the CPU oracle"
+        );
     }
 }

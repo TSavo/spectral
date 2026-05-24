@@ -1,5 +1,6 @@
 //! spectral-core: CPU spectral path tracer.
 
+pub mod optics;
 pub mod rng;
 pub mod sellmeier;
 pub mod spectrum;

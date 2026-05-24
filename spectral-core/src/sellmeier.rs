@@ -5,6 +5,7 @@
 pub enum Glass {
     Bk7,
     Sf11,
+    Water,
 }
 
 impl Glass {
@@ -19,11 +20,18 @@ impl Glass {
                 [1.73759695, 0.313747346, 1.89878101],
                 [0.013188707, 0.0623068142, 155.23629],
             ),
+            Glass::Water => unreachable!("Water uses Cauchy form, not Sellmeier coefficients"),
         }
     }
 
     /// Index of refraction at wavelength `lambda_nm`.
     pub fn n(self, lambda_nm: f32) -> f32 {
+        if let Glass::Water = self {
+            // Cauchy fit for liquid water across the visible band.
+            // n(λ) = 1.3238 + 0.00314 / λ_µm²  (λ in micrometers)
+            let l_um = (lambda_nm as f64) / 1000.0;
+            return (1.3238 + 0.00314 / (l_um * l_um)) as f32;
+        }
         let l_um = (lambda_nm as f64) / 1000.0; // nm -> micrometers
         let l2 = l_um * l_um;
         let (b, c) = self.coeffs();
@@ -59,5 +67,13 @@ mod tests {
     fn sf11_disperses_more_than_bk7() {
         let spread = |g: Glass| g.n(450.0) - g.n(650.0);
         assert!(spread(Glass::Sf11) > spread(Glass::Bk7));
+    }
+
+    #[test]
+    fn water_index_matches_known_values() {
+        use approx::assert_relative_eq;
+        // ~1.333 at the sodium D line (589nm), normal dispersion (blue > red).
+        assert_relative_eq!(Glass::Water.n(589.0), 1.333, epsilon = 2e-3);
+        assert!(Glass::Water.n(450.0) > Glass::Water.n(650.0));
     }
 }

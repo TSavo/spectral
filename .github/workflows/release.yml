@@ -1,0 +1,80 @@
+name: release
+
+# Build the spectral-viewer binary natively on each OS (cross-compiling a
+# wgpu/winit GUI app from one host is a linker/system-lib nightmare, so we let
+# each runner build its own). Produces downloadable binaries as workflow
+# artifacts, and attaches them to a GitHub Release when a v* tag is pushed.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: spectral-viewer-macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            name: spectral-viewer-macos-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: spectral-viewer-linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: spectral-viewer-windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # winit/wgpu need X11 + Wayland + xkbcommon dev headers to build on Linux.
+      - name: Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+
+      - name: Build spectral-viewer
+        run: cargo build --release -p spectral-viewer --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/${{ matrix.target }}/release/spectral-viewer.exe "dist/${{ matrix.name }}.exe"
+          else
+            cp target/${{ matrix.target }}/release/spectral-viewer "dist/${{ matrix.name }}"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+
+      - name: Attach to release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

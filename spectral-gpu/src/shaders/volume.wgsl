@@ -425,13 +425,73 @@ fn phase_hg(g: f32, cos_theta: f32) -> f32 {
 // ---------------------------------------------------------------------------
 // Film splat
 // ---------------------------------------------------------------------------
-fn film_splat(idx: u32, xyz: vec3<f32>) {
+// World-space radius of a photon beam's cross-section (matches volume.rs R_BEAM).
+const R_BEAM: f32 = 0.03;
+
+fn film_splat(idx: u32, xyz: vec3<f32>, dither: u32) {
     // Clamp to [0, 4e9] before the u32 cast: negatives are nonsense and a huge
     // float -> u32 is implementation-defined. 4e9 < u32::MAX is wrap-safe.
     let x = clamp(xyz * SCALE, vec3<f32>(0.0), vec3<f32>(4.0e9));
-    atomicAdd(&film[3u * idx + 0u], u32(x.x));
-    atomicAdd(&film[3u * idx + 1u], u32(x.y));
-    atomicAdd(&film[3u * idx + 2u], u32(x.z));
+    // VOL-7: stochastic rounding. Floor is biased-low and at the dim extremes
+    // (tiny weighted deposits) it drops the smallest CMF channel, snapping each
+    // photon to a quantized hue (the blue/teal dithering that passes reinforce).
+    // Round up with probability = fractional part -> E[deposit] = x exactly ->
+    // unbiased -> the banding becomes zero-mean noise that averages out. The
+    // dither RNG is independent of the photon's PathRng (separate stream seeded
+    // by an invocation hash incl. pixel + channel), so the path stream is
+    // untouched (per-photon parity preserved) and it stays deterministic.
+    var dr = rng_new(dither, params.seed);
+    let lo = floor(x);
+    let f  = x - lo;
+    let b0 = select(0.0, 1.0, rng_next_f32(&dr) < f.x);
+    let b1 = select(0.0, 1.0, rng_next_f32(&dr) < f.y);
+    let b2 = select(0.0, 1.0, rng_next_f32(&dr) < f.z);
+    atomicAdd(&film[3u * idx + 0u], u32(lo.x + b0));
+    atomicAdd(&film[3u * idx + 1u], u32(lo.y + b1));
+    atomicAdd(&film[3u * idx + 2u], u32(lo.z + b2));
+}
+
+// Energy-conserving transverse splat (mirrors volume.rs splat_transverse): tent
+// footprint of radius `radius_px` at screen (s, t), weights renormalised over the
+// pixels actually covered so screen-edge clipping loses no energy.
+fn splat_transverse(s: f32, t: f32, color: vec3<f32>, radius_px: f32, dither_base: u32) {
+    let w = params.width;
+    let h = params.height;
+    let cx = s * f32(w) - 0.5;
+    let cy = (1.0 - t) * f32(h) - 0.5;
+    let r  = max(radius_px, 0.5);
+    let ix0 = max(i32(floor(cx - r)), 0);
+    let ix1 = min(i32(ceil(cx + r)), i32(w) - 1);
+    let iy0 = max(i32(floor(cy - r)), 0);
+    let iy1 = min(i32(ceil(cy + r)), i32(h) - 1);
+
+    var wsum = 0.0;
+    for (var py = iy0; py <= iy1; py = py + 1) {
+        for (var px = ix0; px <= ix1; px = px + 1) {
+            let dx = f32(px) - cx;
+            let dy = f32(py) - cy;
+            wsum = wsum + max(1.0 - sqrt(dx * dx + dy * dy) / r, 0.0);
+        }
+    }
+    if wsum <= 0.0 {
+        let px = u32(clamp(i32(round(cx)), 0, i32(w) - 1));
+        let py = u32(clamp(i32(round(cy)), 0, i32(h) - 1));
+        film_splat(py * w + px, color, dither_base);
+        return;
+    }
+    let inv = 1.0 / wsum;
+    for (var py = iy0; py <= iy1; py = py + 1) {
+        for (var px = ix0; px <= ix1; px = px + 1) {
+            let dx = f32(px) - cx;
+            let dy = f32(py) - cy;
+            let wgt = max(1.0 - sqrt(dx * dx + dy * dy) / r, 0.0) * inv;
+            if wgt > 0.0 {
+                let idx = u32(py) * w + u32(px);
+                let dseed = dither_base ^ (u32(px) * 73856093u) ^ (u32(py) * 19349663u);
+                film_splat(idx, color * wgt, dseed);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -524,28 +584,56 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let sh      = scene_intersect(ro, rd);
         let seg_len = select(params.max_dist, sh.hit.t, sh.any);
 
-        // Mirror render_volumetric_scene lines 129-149: for _ in 0..SEG_SAMPLES.
-        // CONSUME the rng draw regardless of on-screen / occlusion (RNG order is
-        // load-bearing for the diff gate).
-        for (var k = 0u; k < 4u; k = k + 1u) {
-            let dist = rng_next_f32(&rng) * seg_len;
+        // VOL-7 beam splat (mirrors render_volumetric_scene): march the segment
+        // as a continuous beam with transverse volume. ~2 steps per projected
+        // pixel; each step deposits an energy-conserving transverse footprint.
+        // NO rng draws here -- the point estimator's 4 dist draws are removed on
+        // BOTH sides, so the Fresnel scatter draw below stays in lockstep with
+        // the CPU oracle (per-photon parity preserved).
+        let p_end = ro + rd * seg_len;
+        let pj0 = camera_project(ro);
+        let pj1 = camera_project(p_end);
+        var m: u32;
+        if pj0.x >= 0.0 && pj1.x >= 0.0 {
+            let mdx = (pj1.x - pj0.x) * f32(w);
+            let mdy = (pj1.y - pj0.y) * f32(h);
+            m = clamp(u32(ceil(sqrt(mdx * mdx + mdy * mdy) * 2.0)) + 1u, 1u, 4096u);
+        } else {
+            m = clamp(u32(ceil(seg_len * 80.0)), 1u, 4096u);
+        }
+        let ds = seg_len / f32(m);
+        for (var k = 0u; k < m; k = k + 1u) {
+            let dist = (f32(k) + 0.5) * ds;
             let p    = ro + rd * dist;
             let proj = camera_project(p);
             if proj.x >= 0.0 {
-                let px  = min(u32(proj.x * f32(w)), w - 1u);
-                let py  = min(u32((1.0 - proj.y) * f32(h)), h - 1u);
+                let px = min(u32(proj.x * f32(w)), w - 1u);
+                let py = min(u32((1.0 - proj.y) * f32(h)), h - 1u);
                 let pidx = py * w + px;
-
-                // Full single-scatter camera-connection weight.
                 let to = params.cam_origin.xyz - p;
                 let d  = max(length(to), 1e-3);
                 if d < zbuffer[pidx] {
-                    let cos_theta = dot(rd, to / d);
+                    let view      = to / d;
+                    let cos_theta = dot(rd, view);
                     let phase     = phase_hg(params.g, cos_theta);
                     let trans     = exp(-params.sigma_t * d);
-                    let contrib   = power * params.sigma_s * phase * trans / (d * d)
-                                    * seg_len / SEG_SAMPLES;
-                    film_splat(pidx, xyz_cmf * contrib);
+                    let weight    = power * params.sigma_s * phase * trans / (d * d) * ds;
+                    let color     = xyz_cmf * weight;
+                    // Transverse footprint = projected R_BEAM at p (the volume).
+                    var perp = cross(view, vec3<f32>(0.0, 1.0, 0.0));
+                    if dot(perp, perp) < 1e-8 {
+                        perp = cross(view, vec3<f32>(1.0, 0.0, 0.0));
+                    }
+                    perp = normalize(perp) * R_BEAM;
+                    let pjr = camera_project(p + perp);
+                    var radius_px = 1.0;
+                    if pjr.x >= 0.0 {
+                        let rdx = (pjr.x - proj.x) * f32(w);
+                        let rdy = (pjr.y - proj.y) * f32(h);
+                        radius_px = clamp(sqrt(rdx * rdx + rdy * rdy), 1.5, 24.0);
+                    }
+                    let dbase = photon_idx * 2654435761u ^ (bounce * 2246822519u) ^ (k * 3266489917u);
+                    splat_transverse(proj.x, proj.y, color, radius_px, dbase);
                 }
             }
         }
@@ -636,7 +724,7 @@ fn rim_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             0.02  + rim * 0.5,
             0.04  + rim * 0.6,
         );
-        film_splat(pidx, xyz);
+        film_splat(pidx, xyz, pidx);
     }
     // else: background [0,0,0] — write nothing (film was cleared before dispatch).
 }

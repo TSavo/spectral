@@ -37,7 +37,11 @@ use winit::window::{Window, WindowId};
 const SIZE: u32 = 700;
 /// Photons traced per frame. 500K keeps a 16" MBP's Metal under the watchdog and
 /// off the thermal throttle while converging quickly.
-const PHOTONS_PER_FRAME: u32 = 500_000;
+// VOL-7: the beam-splat kernel is ~100x heavier per photon than the old point
+// splat, so 500K/frame would blow the Metal watchdog on frame 1. 20K/frame stays
+// well under it; progressive accumulation (with per-frame-varying dither) fills
+// in and converges over frames.
+const PHOTONS_PER_FRAME: u32 = 20_000;
 /// Fixed reference photon count: the volumetric term is normalized by the actual
 /// total photons emitted, then multiplied by TARGET_N so the fan reads at a stable
 /// brightness regardless of how many frames have accumulated (converge in noise,

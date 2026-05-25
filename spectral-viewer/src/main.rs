@@ -37,11 +37,9 @@ use winit::window::{Window, WindowId};
 const SIZE: u32 = 700;
 /// Photons traced per frame. 500K keeps a 16" MBP's Metal under the watchdog and
 /// off the thermal throttle while converging quickly.
-// VOL-7: the beam-splat kernel is ~100x heavier per photon than the old point
-// splat, so 500K/frame would blow the Metal watchdog on frame 1. 20K/frame stays
-// well under it; progressive accumulation (with per-frame-varying dither) fills
-// in and converges over frames.
-const PHOTONS_PER_FRAME: u32 = 20_000;
+// Point splatting is cheap, so a big batch per frame converges in a handful of
+// frames; the screen-space neighbor kernel makes even the first frame read smooth.
+const PHOTONS_PER_FRAME: u32 = 200_000;
 /// Fixed reference photon count: the volumetric term is normalized by the actual
 /// total photons emitted, then multiplied by TARGET_N so the fan reads at a stable
 /// brightness regardless of how many frames have accumulated (converge in noise,
@@ -110,7 +108,7 @@ struct ViewerParams {
     target_n:      f32,
     exposure:      f32,
     scale:         f32,
-    _pad1:         f32,
+    kradius:       f32,   // screen-space reconstruction-kernel radius (px)
 };
 
 @group(0) @binding(0) var<storage, read> accum:   array<u32>;   // 3*w*h fixed-point
@@ -139,14 +137,35 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let py = min(u32(in.uv.y * f32(h)), h - 1u);
     let idx = py * w + px;
 
-    // Volumetric: fixed-point accum / SCALE / total_photons * TARGET_N.
+    // Volumetric: fixed-point accum / SCALE / total_photons * TARGET_N, gathered
+    // over a screen-space neighbor kernel (the "kernel for neighboring photons" —
+    // a density estimate that makes sparse photon hits read as smooth volumetric
+    // radiance and converges to the unfiltered result as photons accumulate).
     let inv_n = 1.0 / max(f32(params.total_photons), 1.0);
     let k = (1.0 / params.scale) * inv_n * params.target_n;
-    let vol = vec3<f32>(
-        f32(accum[3u * idx + 0u]) * k,
-        f32(accum[3u * idx + 1u]) * k,
-        f32(accum[3u * idx + 2u]) * k,
-    );
+    let radius = i32(params.kradius);
+    let sigma = max(params.kradius * 0.5, 0.5);
+    let inv2s2 = 1.0 / (2.0 * sigma * sigma);
+    var acc = vec3<f32>(0.0);
+    var wsum = 0.0;
+    for (var dy = -radius; dy <= radius; dy = dy + 1) {
+        for (var dx = -radius; dx <= radius; dx = dx + 1) {
+            let sx = i32(px) + dx;
+            let sy = i32(py) + dy;
+            if sx >= 0 && sx < i32(w) && sy >= 0 && sy < i32(h) {
+                let sidx = u32(sy) * w + u32(sx);
+                let g = exp(-f32(dx * dx + dy * dy) * inv2s2);
+                acc = acc + vec3<f32>(
+                    f32(accum[3u * sidx + 0u]),
+                    f32(accum[3u * sidx + 1u]),
+                    f32(accum[3u * sidx + 2u]),
+                ) * g;
+                wsum = wsum + g;
+            }
+        }
+    }
+    // Normalized weighted mean (energy-preserving reconstruction, no brightening).
+    let vol = acc * (k / max(wsum, 1e-6));
     let surf = vec3<f32>(surface[3u * idx + 0u], surface[3u * idx + 1u], surface[3u * idx + 2u]);
 
     let composite = (vol + surf) * params.exposure;
@@ -164,7 +183,7 @@ struct ViewerParams {
     target_n: f32,
     exposure: f32,
     scale: f32,
-    _pad1: f32,
+    kradius: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +284,7 @@ impl<'ctx> Renderer<'ctx> {
             target_n: TARGET_N,
             exposure: 1.0,
             scale: SCALE,
-            _pad1: 0.0,
+            kradius: 2.0, // screen-space neighbor kernel: 5x5 gather
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("viewer_params"),
@@ -701,7 +720,15 @@ impl State {
     }
 
     fn render(&mut self) {
+        // DIAGNOSTIC: dispatch the photon batch + resolve, then BLOCK on the GPU so
+        // `accum_ms` is the real GPU frame time (not just CPU submission). A single
+        // dispatch over ~5s is killed by the macOS GPU watchdog with no Rust-level
+        // panic (process just vanishes), so the per-frame timing + the last logged
+        // frame number are how we catch it.
+        let t0 = std::time::Instant::now();
         self.renderer.accumulate_frame();
+        self.ctx.device.poll(wgpu::Maintain::Wait);
+        let accum_ms = t0.elapsed().as_secs_f32() * 1000.0;
         self.frames += 1;
 
         // Rolling exposure: refresh every 30 frames (cheap readback at this res).
@@ -712,7 +739,8 @@ impl State {
 
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("[frame {}] surface error: {e:?} — reconfiguring", self.frames);
                 self.surface.configure(&self.ctx.device, &self.surface_config);
                 return;
             }
@@ -720,6 +748,22 @@ impl State {
         let view = frame.texture.create_view(&Default::default());
         self.renderer.blit_into(&view);
         frame.present();
+
+        if self.frames <= 60 || self.frames.is_multiple_of(20) {
+            eprintln!(
+                "[frame {}] accumulate+resolve={:.1}ms  photons≈{}",
+                self.frames,
+                accum_ms,
+                self.frames as u64 * PHOTONS_PER_FRAME as u64
+            );
+        }
+        if accum_ms > 500.0 {
+            eprintln!(
+                "[frame {}] WARNING: GPU frame {:.0}ms — nearing the ~5s watchdog; a heavier \
+                 frame (e.g. long beams after an orbit) may SIGKILL the process with no error",
+                self.frames, accum_ms
+            );
+        }
     }
 }
 
@@ -752,9 +796,19 @@ impl ApplicationHandler for App {
             Box::leak(Box::new(GpuContext::new_for_surface(self.instance, &surface)));
         drop(surface);
 
+        // DIAGNOSTIC: log GPU validation / OOM errors that wgpu would otherwise
+        // swallow (these can precede a device loss / silent process death).
+        ctx.device.on_uncaptured_error(Box::new(|e| {
+            eprintln!("[wgpu uncaptured error] {e}");
+        }));
+
         println!("spectral-viewer: live forward+volumetric DSOTM.");
         println!("  drag or arrow keys to orbit, SPACE toggles dispersion (rainbow <-> white), ESC to quit.");
         println!("  starting with dispersion ON (n(lambda)).");
+        eprintln!(
+            "[startup] {}x{} window, {} photons/frame (beam-splat); converges over ~100+ frames",
+            SIZE as u32, SIZE as u32, PHOTONS_PER_FRAME
+        );
 
         let state = State::new(ctx, self.instance, window);
         self.state = Some(state);
@@ -767,11 +821,17 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(state) = self.state.as_mut() else { return };
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                eprintln!("[exit] window CloseRequested at frame {}", state.frames);
+                event_loop.exit();
+            }
 
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 match event.physical_key {
-                    PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
+                    PhysicalKey::Code(KeyCode::Escape) => {
+                        eprintln!("[exit] Escape at frame {}", state.frames);
+                        event_loop.exit();
+                    }
                     PhysicalKey::Code(KeyCode::Space) => {
                         let on = !state.renderer.film.spectral();
                         state.renderer.set_spectral(on);

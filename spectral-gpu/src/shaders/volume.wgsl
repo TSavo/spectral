@@ -584,26 +584,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let sh      = scene_intersect(ro, rd);
         let seg_len = select(params.max_dist, sh.hit.t, sh.any);
 
-        // VOL-7 beam splat (mirrors render_volumetric_scene): march the segment
-        // as a continuous beam with transverse volume. ~2 steps per projected
-        // pixel; each step deposits an energy-conserving transverse footprint.
-        // NO rng draws here -- the point estimator's 4 dist draws are removed on
-        // BOTH sides, so the Fresnel scatter draw below stays in lockstep with
-        // the CPU oracle (per-photon parity preserved).
-        let p_end = ro + rd * seg_len;
-        let pj0 = camera_project(ro);
-        let pj1 = camera_project(p_end);
-        var m: u32;
-        if pj0.x >= 0.0 && pj1.x >= 0.0 {
-            let mdx = (pj1.x - pj0.x) * f32(w);
-            let mdy = (pj1.y - pj0.y) * f32(h);
-            m = clamp(u32(ceil(sqrt(mdx * mdx + mdy * mdy) * 2.0)) + 1u, 1u, 4096u);
-        } else {
-            m = clamp(u32(ceil(seg_len * 80.0)), 1u, 4096u);
-        }
-        let ds = seg_len / f32(m);
-        for (var k = 0u; k < m; k = k + 1u) {
-            let dist = (f32(k) + 0.5) * ds;
+        // Point estimator (cheap): 4 random scatter samples per segment, deposited
+        // at the nearest pixel. The viewer's screen-space neighbor kernel reconstructs
+        // smooth volumetric density from these sparse hits, and high photons/frame
+        // give along-beam density -- so we don't pay for a per-photon footprint.
+        // The 4 dist draws are mirrored by the CPU oracle (render_volumetric_scene_point)
+        // and the parity sim, keeping the RNG stream in lockstep.
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            let dist = rng_next_f32(&rng) * seg_len;
             let p    = ro + rd * dist;
             let proj = camera_project(p);
             if proj.x >= 0.0 {
@@ -613,27 +601,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let to = params.cam_origin.xyz - p;
                 let d  = max(length(to), 1e-3);
                 if d < zbuffer[pidx] {
-                    let view      = to / d;
-                    let cos_theta = dot(rd, view);
+                    let cos_theta = dot(rd, to / d);
                     let phase     = phase_hg(params.g, cos_theta);
                     let trans     = exp(-params.sigma_t * d);
-                    let weight    = power * params.sigma_s * phase * trans / (d * d) * ds;
-                    let color     = xyz_cmf * weight;
-                    // Transverse footprint = projected R_BEAM at p (the volume).
-                    var perp = cross(view, vec3<f32>(0.0, 1.0, 0.0));
-                    if dot(perp, perp) < 1e-8 {
-                        perp = cross(view, vec3<f32>(1.0, 0.0, 0.0));
-                    }
-                    perp = normalize(perp) * R_BEAM;
-                    let pjr = camera_project(p + perp);
-                    var radius_px = 1.0;
-                    if pjr.x >= 0.0 {
-                        let rdx = (pjr.x - proj.x) * f32(w);
-                        let rdy = (pjr.y - proj.y) * f32(h);
-                        radius_px = clamp(sqrt(rdx * rdx + rdy * rdy), 1.5, 24.0);
-                    }
+                    let contrib   = power * params.sigma_s * phase * trans / (d * d) * seg_len / 4.0;
                     let dbase = photon_idx * 2654435761u ^ (bounce * 2246822519u) ^ (k * 3266489917u);
-                    splat_transverse(proj.x, proj.y, color, radius_px, dbase);
+                    film_splat(pidx, xyz_cmf * contrib, dbase);
                 }
             }
         }

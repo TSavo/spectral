@@ -934,7 +934,7 @@ pub mod tests {
         beam: &Beam,
         photon_idx: u32,
         seed: u32,
-        _max_dist: f32,
+        max_dist: f32,
     ) -> (Vec<(Vec3, Vec3)>, f32, u32) {
         use spectral_core::optics::refract;
 
@@ -951,9 +951,14 @@ pub mod tests {
 
         for _ in 0..8 {
             let hit = scene.intersect(&Ray { origin: ro, dir: rd });
-            // VOL-7: beam-splat removed the 4 per-segment `dist` draws from BOTH
-            // the CPU oracle and the GPU kernel, so the Fresnel scatter draw below
-            // stays in lockstep across CPU/GPU (per-photon path parity preserved).
+            let seg_len = hit.as_ref().map(|(h, _)| h.t).unwrap_or(max_dist);
+
+            // Point estimator: 4 per-segment dist draws (mirrors the GPU kernel and
+            // render_volumetric_scene_point) — keeps the Fresnel scatter draw below
+            // in lockstep across CPU/GPU.
+            for _ in 0..4 {
+                let _dist = rng.next_f32() * seg_len;
+            }
 
             match hit {
                 Some((h, mat)) => {
@@ -1418,19 +1423,19 @@ pub mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn vol_diff_gate() {
-        use spectral_core::volume::render_volumetric_scene;
+        use spectral_core::volume::render_volumetric_scene_point;
 
         let Some(ctx) = GpuContext::new() else {
             eprintln!("no GPU; skipping vol_diff_gate (no GPU adapter)");
             return;
         };
 
-        // VOL-7: beam-splat is ~100x heavier per photon than point-splat, and the
-        // CPU oracle side runs single-threaded, so keep the count low (the L1 and
-        // energy deltas are integral quantities, stable well below this). 120K
-        // took ~10min; 15K keeps the gate to ~1min while staying representative.
+        // Point estimator is cheap, so a healthy count keeps the L1/energy deltas
+        // stable. Compares GPU point-splat (with stochastic rounding) vs the CPU
+        // point oracle; the screen-space reconstruction kernel is a viewer-only
+        // display filter and is intentionally NOT part of this film-level gate.
         let (w, h) = (200usize, 200usize);
-        let n_photons = 15_000u32;
+        let n_photons = 200_000u32;
         let seed = 7u32;
         let max_dist = 14.0_f32;
         let weights = VolWeights::default(); // sigma_s=0.5, sigma_t=0.06, g=0.5
@@ -1447,7 +1452,7 @@ pub mod tests {
 
         // CPU oracle.
         let (scene_cpu, beam_cpu, cam_cpu) = dsotm_scene();
-        let cpu = render_volumetric_scene(
+        let cpu = render_volumetric_scene_point(
             &scene_cpu, &cam_cpu, &beam_cpu, w, h, n_photons,
             weights.sigma_s, weights.sigma_t, weights.g, max_dist, &zbuf, seed,
         ); // Vec<[f32;3]>
